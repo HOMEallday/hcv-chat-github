@@ -2,6 +2,10 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 from typing import Optional # Import Optional for optional types
+from dotenv import load_dotenv # Import load_dotenv
+
+# Load environment variables from .env file immediately
+load_dotenv()
 
 class Settings(BaseSettings):
     # Google Cloud Project ID
@@ -19,3 +23,4 @@ settings = Settings()
 
 # DO NOT set GOOGLE_APPLICATION_CREDENTIALS here.
 # It should be set as an environment variable in your shell before running the app.
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
