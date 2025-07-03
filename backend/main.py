@@ -6,7 +6,7 @@ import json
 import logging
 import queue # Import queue module for synchronous queue
 from starlette.websockets import WebSocketState # Import WebSocketState for connection check
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -260,6 +260,9 @@ async def websocket_endpoint(websocket: WebSocket):
     # with the synchronous `speech_client.streaming_recognize` call (run in a thread).
     sync_recognize_requests_queue = queue.Queue()
     
+    # Asynchronous queue for STT results to be processed in the main event loop.
+    stt_results_queue = asyncio.Queue()
+
     # Flag to control streaming and task lifecycle
     is_recording_active = True
 
@@ -270,7 +273,7 @@ async def websocket_endpoint(websocket: WebSocket):
         """
         nonlocal is_recording_active, stt_sample_rate_hertz
         try:
-            while is_recording_active:
+            while is_recording_active and websocket.client_state == WebSocketState.CONNECTED:
                 message = await websocket.receive()
                 
                 # Handle binary (audio) messages
@@ -328,6 +331,8 @@ async def websocket_endpoint(websocket: WebSocket):
         Handles the Speech-to-Text transcription.
         Runs the synchronous `speech_client.streaming_recognize` in a separate thread.
         """
+        nonlocal is_recording_active # Need to be able to set this to False on error
+
         try:
             # Wait for the sample rate to be set by the frontend before configuring STT
             await stt_config_set.wait()
@@ -345,37 +350,72 @@ async def websocket_endpoint(websocket: WebSocket):
                 single_utterance=True, # Stop processing after user stops speaking
             )
 
-            # Perform the streaming recognition in a separate thread using asyncio.to_thread.
-            # This is key to avoid blocking the main asyncio event loop while the synchronous
-            # `synchronous_request_generator` is consumed by `speech_client.streaming_recognize`.
-            responses = await asyncio.to_thread(
-                speech_client.streaming_recognize, streaming_config, synchronous_request_generator()
-            )
+            # Define a synchronous function to run in a separate thread
+            def _run_stt_synchronously() -> List[str]:
+                """
+                Synchronous function to run STT in a separate thread.
+                Collects all final transcripts and returns them.
+                """
+                logger.info("Starting synchronous STT recognition in a new thread.")
+                collected_transcripts = []
+                try:
+                    # This call returns a synchronous iterator
+                    responses_sync_iterator = speech_client.streaming_recognize(
+                        streaming_config, synchronous_request_generator()
+                    )
+                    
+                    for response in responses_sync_iterator:
+                        for result in response.results:
+                            if result.alternatives:
+                                transcript_text = result.alternatives[0].transcript
+                                logger.info(f"STT Final Transcript (from thread): {transcript_text}")
+                                collected_transcripts.append(transcript_text)
+                                if result.is_final:
+                                    # For single_utterance=True, we expect one final result per user turn.
+                                    return collected_transcripts # Exit synchronous loop and return
+                except Exception as e:
+                    logger.error(f"Error within synchronous STT thread: {e}")
+                finally:
+                    logger.info("Synchronous STT thread finished.")
+                    return collected_transcripts # Ensure transcripts are returned even on error
 
-            # Iterate over the async responses from the STT client
-            # The `responses` object returned by `streaming_recognize` is an async iterable.
-            async for response in responses:
-                for result in response.results:
-                    if result.alternatives:
-                        transcript_text = result.alternatives[0].transcript
-                        logger.info(f"STT Final Transcript: {transcript_text}")
-                        # Send final transcript back to frontend for display
-                        await websocket.send_text(f"You: {transcript_text}")
+            # Run the synchronous STT function in a separate thread
+            final_transcripts = await asyncio.to_thread(_run_stt_synchronously)
+            logger.info(f"STT processing task completed. Final transcripts: {final_transcripts}")
 
-                        if result.is_final:
-                            # Process final transcript with Dialogflow/LLM
-                            await process_final_transcript(transcript_text)
-                            # After a final result with `single_utterance=True`, the STT stream
-                            # on Google's side will close automatically.
-                            return # Exit transcription loop after final result
-            logger.info("STT finished processing for the current utterance.")
+            # Put collected final transcripts into the async queue for main loop processing
+            for transcript_text in final_transcripts:
+                await stt_results_queue.put(transcript_text)
+            await stt_results_queue.put(None) # Sentinel to signal end of this utterance's results
 
         except Exception as e:
-            logger.error(f"Error during speech transcription: {e}")
-            # Ensure the audio consumer also stops if transcription fails
-            sync_recognize_requests_queue.put_nowait(None) # Signal end to synchronous_request_generator
+            logger.error(f"Error during speech transcription task setup/execution: {e}")
             is_recording_active = False # Ensure recording stops if STT fails
+            # Also signal error/end to the STT results queue
+            await stt_results_queue.put(None)
 
+    async def process_stt_results():
+        """
+        Consumes final STT transcripts from the queue and processes them.
+        """
+        nonlocal is_recording_active
+        try:
+            while is_recording_active: # Loop while recording is active
+                transcript_text = await stt_results_queue.get()
+                if transcript_text is None: # Sentinel for end of utterance
+                    logger.info("Received STT results sentinel, stopping processing for this turn.")
+                    # This break will exit the while loop for the current turn.
+                    # The outer try/finally or task cancellation will handle full shutdown.
+                    break 
+                
+                await process_final_transcript(transcript_text)
+        except Exception as e:
+            logger.error(f"Error processing STT results: {e}")
+            is_recording_active = False # Stop if error occurs
+        finally:
+            logger.info("STT results processing task finished.")
+            # Ensure the queue is marked as done for the current task, if it was consuming.
+            # This is more for graceful shutdown of the queue itself if it were persistent.
 
     async def process_final_transcript(transcript_text: str):
         """
@@ -387,6 +427,9 @@ async def websocket_endpoint(websocket: WebSocket):
         if not transcript_text.strip():
             logger.info("Empty transcript, skipping LLM/Dialogflow.")
             return
+
+        # Send transcript back to frontend for display (this ensures it's shown after processing)
+        await websocket.send_text(f"You: {transcript_text}")
 
         # --- Option 1: Direct LLM (Gemini) Call (uncomment to use) ---
         # response_text = await get_gemini_response(transcript_text)
@@ -496,10 +539,14 @@ async def websocket_endpoint(websocket: WebSocket):
         # Create the transcription task (pulls from sync queue, calls STT, processes response)
         transcribe_task = asyncio.create_task(transcribe_speech())
 
-        # Wait for either task to finish (e.g., client disconnects or STT finishes processing)
+        # Create the STT results processing task (consumes from async queue, calls LLM/Dialogflow, TTS)
+        stt_results_processor_task = asyncio.create_task(process_stt_results())
+
+        # Wait for any of the main tasks to finish (e.g., client disconnects, or STT/processing completes)
+        # Using FIRST_COMPLETED means as soon as one task finishes, we start cleanup.
         done, pending = await asyncio.wait(
-            [audio_consumer_task, transcribe_task],
-            return_when=asyncio.FIRST_COMPLETED # Finish when the first task completes
+            [audio_consumer_task, transcribe_task, stt_results_processor_task],
+            return_when=asyncio.FIRST_COMPLETED
         )
 
         # Cancel any remaining pending tasks to ensure clean shutdown
@@ -515,5 +562,24 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket endpoint encountered an unexpected error: {e}")
     finally:
-        is_recording_active = False # Ensure flag is set to false for any lingering processes
-        await websocket.close() # Ensure WebSocket is closed
+        # This `finally` block ensures cleanup when the `websocket_endpoint` coroutine exits.
+        # It's crucial to set `is_recording_active = False` here to signal all tasks to stop.
+        is_recording_active = False 
+        # Also, ensure the synchronous queue is signaled to prevent its thread from hanging.
+        # This is important if consume_audio_stream or transcribe_speech were still running.
+        try:
+            sync_recognize_requests_queue.put_nowait(None)
+        except queue.Full:
+            pass # Ignore if queue is full during shutdown
+        
+        # And the async queue for results
+        try:
+            stt_results_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass # Ignore if queue is full during shutdown
+        
+        # Finally, close the websocket. This should be the last step.
+        # Check if the websocket is still connected before attempting to close,
+        # to avoid the "Unexpected ASGI message 'websocket.close'" error.
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
