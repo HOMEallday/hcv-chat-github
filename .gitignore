@@ -1,0 +1,32 @@
+# Node.js dependencies
+/frontend/node_modules
+
+# Python virtual environments
+/backend/myenv1/
+
+
+# Environment variables (sensitive info)
+/backend/.env
+
+# Build artifacts (React)
+/frontend/dist # If Vite builds to 'dist'
+
+# Editor/IDE specific files
+.vscode/ # VS Code settings
+.idea/   # IntelliJ/PyCharm settings
+*.iml
+
+# Operating System files
+.DS_Store # macOS
+Thumbs.db # Windows
+
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# Uvicorn/FastAPI specific
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
