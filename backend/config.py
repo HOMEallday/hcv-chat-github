@@ -24,3 +24,6 @@ settings = Settings()
 # DO NOT set GOOGLE_APPLICATION_CREDENTIALS here.
 # It should be set as an environment variable in your shell before running the app.
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+
+#testing branch
+x=1
