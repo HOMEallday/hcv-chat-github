@@ -273,8 +273,14 @@ async def websocket_endpoint(websocket: WebSocket):
         """
         nonlocal is_recording_active, stt_sample_rate_hertz
         try:
+            # Loop while recording is active AND the websocket is connected
             while is_recording_active and websocket.client_state == WebSocketState.CONNECTED:
-                message = await websocket.receive()
+                try:
+                    message = await websocket.receive()
+                except RuntimeError as e:
+                    logger.warning(f"WebSocket receive error (likely disconnect): {e}")
+                    is_recording_active = False
+                    break # Exit loop if receive fails due to disconnect
                 
                 # Handle binary (audio) messages
                 if message["type"] == "websocket.receive" and "bytes" in message:
@@ -408,7 +414,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     # The outer try/finally or task cancellation will handle full shutdown.
                     break 
                 
-                await process_final_transcript(transcript_text)
+                # Check if WebSocket is still connected before processing and sending response
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    await process_final_transcript(transcript_text)
+                else:
+                    logger.info("WebSocket disconnected, skipping processing of STT results.")
+                    is_recording_active = False # Ensure loop terminates if client disconnected
+                    break
         except Exception as e:
             logger.error(f"Error processing STT results: {e}")
             is_recording_active = False # Stop if error occurs
@@ -429,7 +441,12 @@ async def websocket_endpoint(websocket: WebSocket):
             return
 
         # Send transcript back to frontend for display (this ensures it's shown after processing)
-        await websocket.send_text(f"You: {transcript_text}")
+        # Only send if the websocket is still connected
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(f"You: {transcript_text}")
+        else:
+            logger.info("WebSocket disconnected, cannot send user transcript back to frontend.")
+            return # Exit early if disconnected
 
         # --- Option 1: Direct LLM (Gemini) Call (uncomment to use) ---
         # response_text = await get_gemini_response(transcript_text)
@@ -439,9 +456,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
         if response_text:
             logger.info(f"AI Response Text: {response_text}")
-            await stream_tts_and_send_to_client(response_text)
+            # Only stream TTS if the websocket is still connected
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await stream_tts_and_send_to_client(response_text)
+            else:
+                logger.info("WebSocket disconnected, cannot stream TTS audio.")
         else:
-            await websocket.send_text("I'm sorry, I couldn't generate a response.")
+            logger.info("No AI response text generated.")
+            # Only send error message if the websocket is still connected
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text("I'm sorry, I couldn't generate a response.")
 
 
     async def get_gemini_response(prompt: str) -> str:
@@ -480,6 +504,7 @@ async def websocket_endpoint(websocket: WebSocket):
             response = await dialogflow_sessions_client.detect_intent(
                 session=session_path, query_input=query_input
             )
+            logger.info(f"Dialogflow Raw Response: {response}") # Log raw Dialogflow response
             logger.info(f"Dialogflow Query Result: {response.query_result.fulfillment_text}")
             # Dialogflow's fulfillment_text is the response to send to the user.
             # If Dialogflow triggers a webhook to your backend, your webhook logic
@@ -515,7 +540,11 @@ async def websocket_endpoint(websocket: WebSocket):
             audio_content = response.audio_content
 
             # Send the AI's text response first to the frontend
-            await websocket.send_text(text)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(text)
+            else:
+                logger.info("WebSocket disconnected, cannot send AI text back to frontend.")
+                return
 
             # Chunk the audio and send it over the WebSocket
             chunk_size = 4096 # Adjust as needed for smoother streaming vs. network overhead
@@ -524,12 +553,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Check if the client is still connected before sending
                 if websocket.client_state == WebSocketState.CONNECTED:
                     await websocket.send_bytes(chunk)
+                else:
+                    logger.info("WebSocket disconnected during TTS streaming, stopping audio.")
+                    break # Stop streaming if client disconnects
                 await asyncio.sleep(0.001) # Small delay to yield control and allow other tasks to run
             logger.info("TTS audio streamed to client.")
 
         except Exception as e:
             logger.error(f"Error during TTS generation/streaming: {e}")
-            await websocket.send_text("I'm sorry, I can't speak right now.")
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text("I'm sorry, I can't speak right now.")
 
     # --- Main WebSocket Task Orchestration ---
     try:
@@ -542,20 +575,17 @@ async def websocket_endpoint(websocket: WebSocket):
         # Create the STT results processing task (consumes from async queue, calls LLM/Dialogflow, TTS)
         stt_results_processor_task = asyncio.create_task(process_stt_results())
 
-        # Wait for any of the main tasks to finish (e.g., client disconnects, or STT/processing completes)
-        # Using FIRST_COMPLETED means as soon as one task finishes, we start cleanup.
-        done, pending = await asyncio.wait(
-            [audio_consumer_task, transcribe_task, stt_results_processor_task],
-            return_when=asyncio.FIRST_COMPLETED
+        # Wait for all tasks to complete, or for a WebSocketDisconnect
+        # We explicitly don't use FIRST_COMPLETED here to allow tasks to finish their work.
+        # The `is_recording_active` flag and `None` sentinels are key for graceful exits.
+        await asyncio.gather(
+            audio_consumer_task,
+            transcribe_task,
+            stt_results_processor_task,
+            return_exceptions=True # Allow tasks to fail without stopping gather immediately
         )
 
-        # Cancel any remaining pending tasks to ensure clean shutdown
-        for task in pending:
-            task.cancel()
-        # Wait for cancelled tasks to complete their cancellation
-        await asyncio.gather(*pending, return_exceptions=True)
-
-        logger.info("WebSocket tasks finished.")
+        logger.info("All WebSocket tasks completed.")
 
     except WebSocketDisconnect:
         logger.info("Client disconnected gracefully.")
