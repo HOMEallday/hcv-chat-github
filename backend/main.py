@@ -500,9 +500,9 @@ async def websocket_endpoint(websocket: WebSocket):
         """
         query_input = dialogflow.QueryInput(text=dialogflow.TextInput(text=text, language_code="en-US"))
         try:
-            # Using detect_intent for asynchronous call
-            response = await dialogflow_sessions_client.detect_intent(
-                session=session_path, query_input=query_input
+            # Wrap the synchronous Dialogflow call in asyncio.to_thread
+            response = await asyncio.to_thread(
+                dialogflow_sessions_client.detect_intent, session=session_path, query_input=query_input
             )
             logger.info(f"Dialogflow Raw Response: {response}") # Log raw Dialogflow response
             logger.info(f"Dialogflow Query Result: {response.query_result.fulfillment_text}")
@@ -524,8 +524,8 @@ async def websocket_endpoint(websocket: WebSocket):
         synthesis_input = tts.SynthesisInput(text=text)
         voice = tts.VoiceSelectionParams(
             language_code="en-US",
-            ssml_gender=tts.SsmlVoiceGender.NEUTRAL, # Can be MALE, FEMALE, NEUTRAL
-            name="en-US-Neural2-C" # A natural sounding voice, check Google TTS docs for options
+            ssml_gender=tts.SsmlVoiceGender.FEMALE, # Changed from NEUTRAL to FEMALE
+            name="en-US-Wavenet-F" # Changed from Neural2-C to a common Wavenet voice
         )
         audio_config = tts.AudioConfig(
             audio_encoding=tts.AudioEncoding.LINEAR16, # Raw PCM, 16-bit, mono
