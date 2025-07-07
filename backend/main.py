@@ -106,24 +106,87 @@ html = """
         <div id="transcript"><strong>You:</strong></div>
         <div id="aiResponse"><strong>AI:</strong></div>
         <script>
-            let ws;
-            let mediaStream; // Renamed from mediaRecorder for clarity
-            let audioContext;
-            let audioInput;
-            let processor;
-            let currentSampleRate = 16000; // Default, will be updated by actual AudioContext sampleRate
-
+            // Get references to DOM elements
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
             const transcriptDiv = document.getElementById('transcript');
             const aiResponseDiv = document.getElementById('aiResponse');
 
+            // WebSocket and Audio API variables
+            let ws;
+            let mediaStream;
+            let audioContext;
+            let audioInput;
+            let processor;
+            let currentSampleRate; // Will be set by AudioContext
+
+            // Variables for TTS Audio Chunk Accumulation
+            let currentAudioChunks = [];
+            let expectingAudio = false; // True when we are expecting TTS audio chunks
+            let audioChunkTimeout;      // To detect end of audio stream implicitly
+
+
+            // Function to play audio from a Blob
+            // This function remains largely the same, but it's now called *after*
+            // all chunks are assembled into a single Blob.
+            async function playNextAudio(audioBlob) {
+                if (!audioBlob || audioBlob.size === 0) {
+                    console.warn("Attempted to play empty audio blob.");
+                    return;
+                }
+
+                console.log(`Received audio Blob of size: ${audioBlob.size} type: ${audioBlob.type}`);
+                
+                const audioUrl = URL.createObjectURL(audioBlob);
+                const audio = new Audio(audioUrl);
+
+                // Add detailed logging for audio playback
+                audio.onloadedmetadata = () => {
+                    console.log(`Audio metadata loaded. Duration: ${audio.duration} seconds. Ready state: ${audio.readyState}`);
+                };
+                audio.oncanplaythrough = () => {
+                    console.log('Audio can play through without interruption.');
+                    // This is a good point to start playing if you want immediate playback
+                    // but we'll stick to the current flow for now.
+                };
+                audio.onplaying = () => {
+                    console.log('Audio started playing.');
+                };
+                audio.onended = () => {
+                    console.log('Audio playback ended.');
+                    URL.revokeObjectURL(audioUrl); // Clean up the Blob URL after playback
+                    // Here, you could potentially trigger the next action or allow new input
+                };
+                audio.onerror = (e) => {
+                    console.error('Audio playback error:', e);
+                    if (audio.error) {
+                        console.error('Audio error code:', audio.error.code);
+                        console.error('Audio error message:', audio.error.message);
+                    }
+                    URL.revokeObjectURL(audioUrl);
+                };
+
+                try {
+                    await audio.play();
+                } catch (error) {
+                    console.error("Error attempting to play audio:", error);
+                }
+            }
+
+
+            // --- startButton.onclick remains mostly the same ---
             startButton.onclick = async () => {
                 startButton.disabled = true;
                 stopButton.disabled = false;
                 transcriptDiv.innerHTML = '<strong>You:</strong> '; // Reset content
                 aiResponseDiv.innerHTML = '<strong>AI:</strong> '; // Reset content
                 startButton.classList.add('recording'); // Add recording style
+
+                // Reset audio accumulation variables for a new turn
+                currentAudioChunks = [];
+                expectingAudio = false;
+                if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
+
 
                 ws = new WebSocket("ws://localhost:8000/ws");
 
@@ -138,7 +201,6 @@ html = """
                             console.log("AudioContext sample rate:", currentSampleRate);
 
                             // Send sample rate to backend immediately after opening WebSocket
-                            // This is crucial for STT configuration on the backend.
                             if (ws.readyState === WebSocket.OPEN) {
                                 ws.send(JSON.stringify({ type: 'sample_rate', value: currentSampleRate }));
                             }
@@ -173,20 +235,49 @@ html = """
                         });
                 };
 
-                ws.onmessage = (event) => {
+                // --- MODIFIED ws.onmessage ---
+                ws.onmessage = async (event) => {
                     if (typeof event.data === 'string') {
-                        // Assuming AI response text or transcript from backend
+                        // It's a text message (either STT transcript or AI response text)
+                        // Your current backend sends AI text as plain text.
+                        // For robust handling, it's better to wrap all messages in JSON,
+                        // but we'll adapt to your current backend's text sending for now.
                         if (event.data.startsWith("You:")) {
                             transcriptDiv.textContent = event.data; // Overwrite for final transcript
+                            // Optionally, if an AI response was pending audio, this could signal its end.
+                            // But usually, AI text comes *before* or *with* the audio.
                         } else {
-                            aiResponseDiv.textContent += event.data; // Append for streaming AI text
+                            // This is likely the AI's text response
+                            aiResponseDiv.textContent = `<strong>AI:</strong> ${event.data}`; // Set for a new response
+                            currentAudioChunks = []; // Clear chunks for a new AI response
+                            expectingAudio = true; // Start collecting audio chunks
+                            console.log("Started expecting audio for new AI response.");
                         }
-                    } else if (event.data instanceof Blob) {
-                        // Assuming AI audio response (Blob)
-                        const audioUrl = URL.createObjectURL(event.data);
-                        const audio = new Audio(audioUrl);
-                        audio.play();
-                        audio.onended = () => URL.revokeObjectURL(audioUrl); // Clean up Blob URL after playback
+                    } else if (event.data instanceof Blob || event.data instanceof ArrayBuffer) {
+                        // It's binary audio data (MP3 chunks from TTS)
+                        if (expectingAudio) {
+                            // Ensure data is a Blob for consistent handling
+                            const blobData = event.data instanceof ArrayBuffer ? new Blob([event.data], { type: 'audio/mpeg' }) : event.data;
+                            currentAudioChunks.push(blobData);
+                            console.log(`Received audio chunk. Current chunks total size: ${currentAudioChunks.reduce((sum, chunk) => sum + chunk.size, 0)} bytes`);
+
+                            // Reset the timeout. If no new chunks arrive within this time,
+                            // we assume the full audio has been received.
+                            if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
+                            audioChunkTimeout = setTimeout(async () => {
+                                if (expectingAudio && currentAudioChunks.length > 0) {
+                                    console.log("Audio chunk timeout. Assuming end of audio stream. Playing collected audio.");
+                                    const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mpeg' });
+                                    await playNextAudio(audioBlob);
+                                    expectingAudio = false; // Finished with this audio turn
+                                    currentAudioChunks = []; // Clear for next turn
+                                } else {
+                                    console.log("Audio chunk timeout, but no audio collected or not expecting.");
+                                }
+                            }, 200); // 200ms delay. Adjust if needed based on network conditions.
+                        } else {
+                            console.warn("Received unexpected audio chunk. Not currently expecting audio or already played.");
+                        }
                     }
                 };
 
@@ -195,6 +286,9 @@ html = """
                     startButton.disabled = false;
                     stopButton.disabled = true;
                     startButton.classList.remove('recording');
+                    if (audioChunkTimeout) clearTimeout(audioChunkTimeout); // Clear any pending audio timeouts
+                    currentAudioChunks = []; // Clear any residual chunks
+                    expectingAudio = false;
                 };
 
                 ws.onerror = (error) => {
@@ -202,6 +296,9 @@ html = """
                     startButton.disabled = false;
                     stopButton.disabled = true;
                     startButton.classList.remove('recording');
+                    if (audioChunkTimeout) clearTimeout(audioChunkTimeout); // Clear any pending audio timeouts
+                    currentAudioChunks = []; // Clear any residual chunks
+                    expectingAudio = false;
                 };
             };
 
@@ -215,8 +312,9 @@ html = """
                     ws.close(); // Close WebSocket connection
                 }
 
+                // Stop media stream and disconnect audio nodes
                 if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop()); // Stop microphone track
+                    mediaStream.getTracks().forEach(track => track.stop());
                 }
                 if (processor) {
                     processor.disconnect();
@@ -225,8 +323,13 @@ html = """
                     audioInput.disconnect();
                 }
                 if (audioContext) {
-                    audioContext.close(); // Close audio context
+                    audioContext.close();
                 }
+                
+                // Clear any pending audio processing on stop
+                if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
+                currentAudioChunks = [];
+                expectingAudio = false;
             };
         </script>
     </body>
