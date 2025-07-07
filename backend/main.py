@@ -6,10 +6,10 @@ import json
 import logging
 import queue # Import queue module for synchronous queue
 from starlette.websockets import WebSocketState # Import WebSocketState for connection check
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, List, Optional, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import speech_v1p1beta1 as speech # Async Speech-to-Text client
 from google.cloud import texttospeech_v1 as tts # Async Text-to-Speech client
@@ -17,6 +17,9 @@ import vertexai # Import Vertex AI SDK
 from vertexai.generative_models import GenerativeModel, GenerationConfig # For Gemini LLM via Vertex AI
 from google.cloud import dialogflow_v2 as dialogflow # Async Dialogflow client
 from google.api_core.exceptions import GoogleAPIError
+
+from google.cloud.dialogflow_v2.types import WebhookRequest, WebhookResponse
+from pydantic import BaseModel # Import BaseModel for webhook request parsing
 
 from config import settings # Our settings from config.py
 
@@ -76,6 +79,106 @@ except Exception as e:
 gemini_config = GenerationConfig(temperature=0.7, top_p=0.9, top_k=40)
 
 
+# --- Dialogflow Webhook Request Model ---
+# This Pydantic model helps parse the incoming JSON from Dialogflow webhook
+class DialogflowWebhookRequest(BaseModel):
+    responseId: Optional[str] = None
+    queryResult: Dict[str, Any]
+    session: Optional[str] = None
+    originalDetectIntentRequest: Optional[Dict[str, Any]] = None
+
+# --- Helper function for calculations ---
+def _perform_calculation(num1: float, num2: float, operation: str) -> str:
+    """Performs the specified mathematical operation."""
+    result = None
+    response_text = ""
+
+    if operation == "add":
+        result = num1 + num2
+    elif operation == "subtract":
+        result = num1 - num2
+    elif operation == "multiply" or operation == "times":
+        result = num1 * num2
+    elif operation == "divide":
+        if num2 != 0:
+            result = num1 / num2
+        else:
+            response_text = "I cannot divide by zero."
+    elif operation == "power":
+        result = num1 ** num2
+    elif operation == "remainder" or operation == "mod" or operation == "modulo":
+        if num2 != 0:
+            result = num1 % num2
+        else:
+            response_text = "I cannot calculate remainder with zero."
+    else:
+        response_text = f"I don't recognize the operation '{operation}'. Please try add, subtract, multiply, divide, power, or remainder."
+
+    if result is not None:
+        response_text = f"The answer is {result}."
+    elif not response_text: # If no specific error message was set by division/remainder by zero
+        response_text = "I couldn't perform that calculation. Please ensure you provided valid numbers and operation."
+    
+    return response_text
+
+# --- Dialogflow Webhook Endpoint ---
+@app.post("/webhook")
+async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
+    """
+    Handles incoming webhook requests from Dialogflow.
+    This endpoint will perform the math calculation based on detected intent and parameters.
+    """
+    logger.info(f"Received Dialogflow webhook request: {request_body.dict()}")
+
+    query_result = request_body.queryResult
+    intent_display_name = query_result.get("intent", {}).get("displayName")
+    parameters = query_result.get("parameters", {})
+
+    fulfillment_text = "I'm sorry, I couldn't process your request." # Default response
+
+    if intent_display_name == "Calculate Math":
+        try:
+            num1 = parameters.get("number1")
+            num2 = parameters.get("number2")
+            operation = parameters.get("operation")
+
+            if num1 is not None and num2 is not None and operation:
+                # Dialogflow parameters are often strings, convert to float
+                num1_float = float(num1)
+                num2_float = float(num2)
+                fulfillment_text = _perform_calculation(num1_float, num2_float, operation)
+            else:
+                fulfillment_text = "I need two numbers and an operation to perform the calculation."
+                logger.warning(f"Missing parameters for Calculate Math intent: num1={num1}, num2={num2}, operation={operation}")
+        except Exception as e:
+            logger.error(f"Error in webhook calculation logic: {e}")
+            fulfillment_text = "I encountered an error while trying to calculate that."
+    else:
+        # For other intents, you might rely on Dialogflow's default fulfillment
+        # or implement other webhook logic here.
+        fulfillment_text = query_result.get("fulfillmentText", "I'm not sure how to respond to that.")
+        logger.info(f"Webhook received intent '{intent_display_name}', using Dialogflow's fulfillment text.")
+
+    # Construct the Dialogflow webhook response
+    webhook_response = {
+        "fulfillmentText": fulfillment_text,
+        "payload": {
+            "google": {
+                "expectUserResponse": True,
+                "richResponse": {
+                    "items": [
+                        {
+                            "simpleResponse": {
+                                "textToSpeech": fulfillment_text,
+                                "displayText": fulfillment_text
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    return JSONResponse(content=webhook_response)
 # --- HTML for simple testing (optional) ---
 # This HTML provides a basic interface to test the WebSocket connection and audio streaming
 # directly from the browser, without needing the React app initially.
@@ -248,7 +351,7 @@ html = """
                             // But usually, AI text comes *before* or *with* the audio.
                         } else {
                             // This is likely the AI's text response
-                            aiResponseDiv.textContent = `<strong>AI:</strong> ${event.data}`; // Set for a new response
+                            aiResponseDiv.innerHTML = `<strong>AI:</strong> ${event.data}`; // Set for a new response
                             currentAudioChunks = []; // Clear chunks for a new AI response
                             expectingAudio = true; // Start collecting audio chunks
                             console.log("Started expecting audio for new AI response.");
