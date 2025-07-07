@@ -8,6 +8,10 @@
 # Environment variables (sensitive info)
 /backend/.env
 
+# Data directory, can contain sensitive information
+/data 
+
+
 # Build artifacts (React)
 /frontend/dist # If Vite builds to 'dist'
 
