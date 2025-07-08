@@ -4,35 +4,154 @@ import os
 import io
 import json
 import logging
-import queue # Import queue module for synchronous queue
-from starlette.websockets import WebSocketState # Import WebSocketState for connection check
+import queue
+from starlette.websockets import WebSocketState
 from typing import AsyncGenerator, List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import speech_v1p1beta1 as speech # Async Speech-to-Text client
-from google.cloud import texttospeech_v1 as tts # Async Text-to-Speech client
-import vertexai # Import Vertex AI SDK
-from vertexai.generative_models import GenerativeModel, GenerationConfig # For Gemini LLM via Vertex AI
-from google.cloud import dialogflow_v2 as dialogflow # Async Dialogflow client
+# Import Google Cloud clients
+from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import texttospeech_v1 as tts
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+# --- MODIFICATION 1: Import the Async Client ---
+from google.cloud import dialogflow_v2 as dialogflow
 from google.api_core.exceptions import GoogleAPIError
 
-from google.cloud.dialogflow_v2.types import WebhookRequest, WebhookResponse
-from pydantic import BaseModel # Import BaseModel for webhook request parsing
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_google_vertexai import ChatVertexAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains.retrieval import create_retrieval_chain
+from langchain_chroma import Chroma
 
-from config import settings # Our settings from config.py
+from config import settings  # Import your settings module
+
+from google.cloud.dialogflow_v2.types import WebhookRequest, WebhookResponse
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# Initialize global variables for clients and models
+speech_client = None
+tts_client = None
+dialogflow_sessions_client = None # This will now be an Async client
+gemini_model = None
+
+# Global variables for RAG components
+vectorstore: Optional[Chroma] = None
+retrieval_chain = None
+gemini_llm: Optional[ChatVertexAI] = None
+
+#Define lifespan context manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles startup and shutdown events for the FastAPI application.
+    All initialization logic is moved here.
+    """
+    global speech_client, tts_client, dialogflow_sessions_client, gemini_model
+    global vectorstore, retrieval_chain, gemini_llm # Declare RAG globals here
+
+    logger.info("Application startup initiated.")
+    try:
+        # --- EXISTING: Google Cloud Clients Initialization (MOVED HERE) ---
+        speech_client = speech.SpeechClient()
+        tts_client = tts.TextToSpeechClient()
+        
+        # --- MODIFICATION 2: Use the SessionsAsyncClient ---
+        # This prevents the server from deadlocking when a webhook is called.
+        dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
+        logger.info("Google Cloud clients (Speech, TTS, Dialogflow Async) initialized successfully.")
+
+        # Initialize Vertex AI for Gemini models (MOVED HERE)
+        vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID, location="us-central1")
+        logger.info(f"Vertex AI initialized for project: {settings.GOOGLE_CLOUD_PROJECT_ID}, location: us-central1")
+
+        # Your original Vertex AI GenerativeModel instance (MOVED HERE)
+        gemini_model = GenerativeModel('gemini-1.5-pro')
+        logger.info("Gemini model ('gemini-1.5-pro') initialized via Vertex AI.")
+
+        # --- LangChain-compatible Gemini model for RAG ---
+        gemini_llm = ChatVertexAI(model_name="gemini-1.5-pro", temperature=0.0) # Lower temp for RAG
+        logger.info("LangChain ChatVertexAI (gemini_llm) initialized for RAG.")
+
+        # --- NEW ADDITION FOR RAG: RAG Component Initialization ---
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001") # Using a common embedding model name
+        logger.info("GoogleGenerativeAIEmbeddings (from langchain_google_genai) initialized for RAG.")
+
+
+        # Adjust this path based on your *exact* directory structure:
+        chroma_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'chroma_db')
+        logger.info(f"Attempting to load Chroma DB from: {chroma_db_path}")
+
+        if not os.path.exists(chroma_db_path):
+            logger.error(f"Chroma DB directory not found at: {chroma_db_path}. RAG will not work.")
+            vectorstore = None
+            retrieval_chain = None
+        else:
+            try:
+                # Load the existing Chroma vector store
+                vectorstore = Chroma(
+                    persist_directory=chroma_db_path,
+                    embedding_function=embeddings
+                )
+                logger.info(f"Chroma vector store loaded from {chroma_db_path}.")
+
+                # Create a retriever from the vector store
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) # Retrieve top 3 similar documents
+
+                # Define the RAG prompt
+                rag_prompt = ChatPromptTemplate.from_messages([
+                    ("system", "You are an AI assistant. Use the following context to answer the user's question. If the question cannot be answered from the context, state that you don't have enough information.\n\nContext:\n{context}"),
+                    ("user", "{input}")
+                ])
+
+                # Create the document stuffing chain (combines retrieved docs into prompt)
+                document_chain = create_stuff_documents_chain(gemini_llm, rag_prompt)
+
+                # Create the full retrieval chain (retriever + document stuffing chain)
+                retrieval_chain = create_retrieval_chain(retriever, document_chain)
+                logger.info("LangChain RAG chain (with semantic search) created successfully.")
+
+            except Exception as e:
+                logger.error(f"Error loading Chroma DB or creating RAG chain: {e}")
+                logger.warning("RAG (semantic search) functionality may be unavailable. Ensure your Chroma DB is correctly set up with compatible embeddings.")
+                vectorstore = None
+                retrieval_chain = None
+
+    except GoogleAPIError as e:
+        logger.error(f"Failed to initialize Google Cloud clients or Vertex AI (RAG): {e}")
+        logger.warning("Ensure your GOOGLE_APPLICATION_CREDENTIALS environment variable is set correctly and the service account has the necessary permissions.")
+        vectorstore = None
+        retrieval_chain = None
+        gemini_llm = None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during client or RAG initialization: {e}")
+        logger.warning("Core functionality or RAG functionality may be unavailable.")
+        vectorstore = None
+        retrieval_chain = None
+        gemini_llm = None
+
+    logger.info("Application startup completed. Yielding control to FastAPI.")
+    yield # This indicates that the application is ready to receive requests.
+
+    # --- Shutdown logic (runs when app is shutting down) ---
+    logger.info("Application shutdown initiated.")
+    logger.info("Application shutdown completed.")
+
+# Pass the lifespan manager to FastAPI ---
+app = FastAPI(lifespan=lifespan)
 
 # Allow CORS for your frontend
 origins = [
     "http://localhost:5173", # Default Vite dev server port
-    # Add your deployed frontend URL here when you deploy, e.g., "https://your-app.com"
 ]
 
 app.add_middleware(
@@ -43,44 +162,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Google Cloud Clients Initialization ---
-# Ensure GOOGLE_APPLICATION_CREDENTIALS environment variable is set.
-# This is handled by config.py, so these clients will pick it up automatically.
-try:
-    # Initialize Google Cloud clients. These use Application Default Credentials
-    # which are picked up from the GOOGLE_APPLICATION_CREDENTIALS env var.
-    speech_client = speech.SpeechClient()
-    tts_client = tts.TextToSpeechClient()
-    dialogflow_sessions_client = dialogflow.SessionsClient()
-    logger.info("Google Cloud clients (Speech, TTS, Dialogflow) initialized successfully using Service Account.")
-
-    # Initialize Vertex AI for Gemini models
-    # The `project` and `location` are crucial for Vertex AI.
-    # 'us-central1' is a common region for Vertex AI.
-    vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID, location="us-central1")
-    logger.info(f"Vertex AI initialized for project: {settings.GOOGLE_CLOUD_PROJECT_ID}, location: us-central1")
-
-    # Using gemini-1.5-pro for general purpose. For production, consider `gemini-1.5-flash` for lower latency.
-    # This model instance will use the credentials from vertexai.init()
-    gemini_model = GenerativeModel('gemini-1.5-pro')
-    logger.info("Gemini model ('gemini-1.5-pro') initialized via Vertex AI.")
-
-except GoogleAPIError as e:
-    logger.error(f"Failed to initialize Google Cloud clients: {e}")
-    logger.warning("Ensure your GOOGLE_APPLICATION_CREDENTIALS environment variable is set correctly and the service account has the necessary permissions (Speech-to-Text Admin, Text-to-Speech Admin, Dialogflow API Client, Vertex AI User).")
-    # In a production app, you might want to raise an exception or have a more robust fallback.
-    # For now, we'll allow the app to start but log the error.
-except Exception as e:
-    logger.error(f"An unexpected error occurred during client initialization: {e}")
-    logger.warning("Please check your environment setup and API configurations.")
-
 
 # Gemini Generation Configuration
 gemini_config = GenerationConfig(temperature=0.7, top_p=0.9, top_k=40)
 
 
 # --- Dialogflow Webhook Request Model ---
-# This Pydantic model helps parse the incoming JSON from Dialogflow webhook
 class DialogflowWebhookRequest(BaseModel):
     responseId: Optional[str] = None
     queryResult: Dict[str, Any]
@@ -116,9 +203,8 @@ def _perform_calculation(num1: float, num2: float, operation: str) -> str:
 
     if result is not None:
         response_text = f"The answer is {result}."
-    elif not response_text: # If no specific error message was set by division/remainder by zero
+    elif not response_text:
         response_text = "I couldn't perform that calculation. Please ensure you provided valid numbers and operation."
-    
     return response_text
 
 # --- Dialogflow Webhook Endpoint ---
@@ -128,7 +214,7 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
     Handles incoming webhook requests from Dialogflow.
     This endpoint will perform the math calculation based on detected intent and parameters.
     """
-    logger.info(f"Received Dialogflow webhook request: {request_body.dict()}")
+    logger.info(f"\nReceived Dialogflow webhook request: {request_body.dict()}")
 
     query_result = request_body.queryResult
     intent_display_name = query_result.get("intent", {}).get("displayName")
@@ -143,7 +229,6 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
             operation = parameters.get("operation")
 
             if num1 is not None and num2 is not None and operation:
-                # Dialogflow parameters are often strings, convert to float
                 num1_float = float(num1)
                 num2_float = float(num2)
                 fulfillment_text = _perform_calculation(num1_float, num2_float, operation)
@@ -154,12 +239,9 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
             logger.error(f"Error in webhook calculation logic: {e}")
             fulfillment_text = "I encountered an error while trying to calculate that."
     else:
-        # For other intents, you might rely on Dialogflow's default fulfillment
-        # or implement other webhook logic here.
         fulfillment_text = query_result.get("fulfillmentText", "I'm not sure how to respond to that.")
         logger.info(f"Webhook received intent '{intent_display_name}', using Dialogflow's fulfillment text.")
 
-    # Construct the Dialogflow webhook response
     webhook_response = {
         "fulfillmentText": fulfillment_text,
         "payload": {
@@ -178,10 +260,10 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
             }
         }
     }
+    logger.info(f"Processed Dialogflow webhook request: {webhook_response}")
     return JSONResponse(content=webhook_response)
-# --- HTML for simple testing (optional) ---
-# This HTML provides a basic interface to test the WebSocket connection and audio streaming
-# directly from the browser, without needing the React app initially.
+
+# --- HTML for simple testing ---
 html = """
 <!DOCTYPE html>
 <html>
@@ -209,66 +291,27 @@ html = """
         <div id="transcript"><strong>You:</strong></div>
         <div id="aiResponse"><strong>AI:</strong></div>
         <script>
-            // Get references to DOM elements
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
             const transcriptDiv = document.getElementById('transcript');
             const aiResponseDiv = document.getElementById('aiResponse');
 
-            // WebSocket and Audio API variables
             let ws;
             let mediaStream;
             let audioContext;
             let audioInput;
             let processor;
-            let currentSampleRate; // Will be set by AudioContext
+            let currentSampleRate;
 
-            // Variables for TTS Audio Chunk Accumulation
-            let currentAudioChunks = [];
-            let expectingAudio = false; // True when we are expecting TTS audio chunks
-            let audioChunkTimeout;      // To detect end of audio stream implicitly
-
-
-            // Function to play audio from a Blob
-            // This function remains largely the same, but it's now called *after*
-            // all chunks are assembled into a single Blob.
             async function playNextAudio(audioBlob) {
                 if (!audioBlob || audioBlob.size === 0) {
                     console.warn("Attempted to play empty audio blob.");
                     return;
                 }
-
-                console.log(`Received audio Blob of size: ${audioBlob.size} type: ${audioBlob.type}`);
-                
                 const audioUrl = URL.createObjectURL(audioBlob);
                 const audio = new Audio(audioUrl);
-
-                // Add detailed logging for audio playback
-                audio.onloadedmetadata = () => {
-                    console.log(`Audio metadata loaded. Duration: ${audio.duration} seconds. Ready state: ${audio.readyState}`);
-                };
-                audio.oncanplaythrough = () => {
-                    console.log('Audio can play through without interruption.');
-                    // This is a good point to start playing if you want immediate playback
-                    // but we'll stick to the current flow for now.
-                };
-                audio.onplaying = () => {
-                    console.log('Audio started playing.');
-                };
-                audio.onended = () => {
-                    console.log('Audio playback ended.');
-                    URL.revokeObjectURL(audioUrl); // Clean up the Blob URL after playback
-                    // Here, you could potentially trigger the next action or allow new input
-                };
-                audio.onerror = (e) => {
-                    console.error('Audio playback error:', e);
-                    if (audio.error) {
-                        console.error('Audio error code:', audio.error.code);
-                        console.error('Audio error message:', audio.error.message);
-                    }
-                    URL.revokeObjectURL(audioUrl);
-                };
-
+                audio.onended = () => URL.revokeObjectURL(audioUrl);
+                audio.onerror = (e) => console.error('Audio playback error:', e);
                 try {
                     await audio.play();
                 } catch (error) {
@@ -276,122 +319,73 @@ html = """
                 }
             }
 
-
-            // --- startButton.onclick remains mostly the same ---
             startButton.onclick = async () => {
                 startButton.disabled = true;
                 stopButton.disabled = false;
-                transcriptDiv.innerHTML = '<strong>You:</strong> '; // Reset content
-                aiResponseDiv.innerHTML = '<strong>AI:</strong> '; // Reset content
-                startButton.classList.add('recording'); // Add recording style
-
-                // Reset audio accumulation variables for a new turn
-                currentAudioChunks = [];
-                expectingAudio = false;
-                if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
-
+                transcriptDiv.innerHTML = '<strong>You:</strong> ';
+                aiResponseDiv.innerHTML = '<strong>AI:</strong> ';
+                startButton.classList.add('recording');
 
                 ws = new WebSocket("ws://localhost:8000/ws");
 
                 ws.onopen = () => {
                     console.log("WebSocket opened");
-                    // Start microphone access
                     navigator.mediaDevices.getUserMedia({ audio: true })
                         .then(stream => {
-                            mediaStream = stream; // Store stream to stop it later
+                            mediaStream = stream;
                             audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                            currentSampleRate = audioContext.sampleRate; // Get actual sample rate from browser
+                            currentSampleRate = audioContext.sampleRate;
                             console.log("AudioContext sample rate:", currentSampleRate);
 
-                            // Send sample rate to backend immediately after opening WebSocket
                             if (ws.readyState === WebSocket.OPEN) {
                                 ws.send(JSON.stringify({ type: 'sample_rate', value: currentSampleRate }));
                             }
 
                             audioInput = audioContext.createMediaStreamSource(mediaStream);
-                            // Create a ScriptProcessorNode to get raw audio data.
-                            // Buffer size (4096), input channels (1), output channels (1).
                             processor = audioContext.createScriptProcessor(4096, 1, 1);
 
                             processor.onaudioprocess = (event) => {
                                 const inputData = event.inputBuffer.getChannelData(0);
-                                // Convert Float32Array (from Web Audio API) to Int16Array (LINEAR16 for Google STT)
                                 const int16Array = new Int16Array(inputData.length);
                                 for (let i = 0; i < inputData.length; i++) {
-                                    // Scale float to 16-bit integer range (-32768 to 32767)
                                     int16Array[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
                                 }
                                 if (ws.readyState === WebSocket.OPEN) {
-                                    ws.send(int16Array.buffer); // Send raw audio bytes
+                                    ws.send(int16Array.buffer);
                                 }
                             };
-
                             audioInput.connect(processor);
-                            processor.connect(audioContext.destination); // Connect to destination to keep processor alive
+                            processor.connect(audioContext.destination);
                         })
                         .catch(err => {
                             console.error("Error accessing microphone:", err);
                             startButton.disabled = false;
                             stopButton.disabled = true;
                             startButton.classList.remove('recording');
-                            alert("Microphone access denied or error: " + err.message); // Use alert for critical user feedback
+                            alert("Microphone access denied or error: " + err.message);
                         });
                 };
 
-                // --- MODIFIED ws.onmessage ---
                 ws.onmessage = async (event) => {
                     if (typeof event.data === 'string') {
-                        // It's a text message (either STT transcript or AI response text)
-                        // Your current backend sends AI text as plain text.
-                        // For robust handling, it's better to wrap all messages in JSON,
-                        // but we'll adapt to your current backend's text sending for now.
                         if (event.data.startsWith("You:")) {
-                            transcriptDiv.textContent = event.data; // Overwrite for final transcript
-                            // Optionally, if an AI response was pending audio, this could signal its end.
-                            // But usually, AI text comes *before* or *with* the audio.
+                            transcriptDiv.textContent = event.data;
                         } else {
-                            // This is likely the AI's text response
-                            aiResponseDiv.innerHTML = `<strong>AI:</strong> ${event.data}`; // Set for a new response
-                            currentAudioChunks = []; // Clear chunks for a new AI response
-                            expectingAudio = true; // Start collecting audio chunks
-                            console.log("Started expecting audio for new AI response.");
+                            aiResponseDiv.innerHTML = `<strong>AI:</strong> ${event.data}`;
                         }
-                    } else if (event.data instanceof Blob || event.data instanceof ArrayBuffer) {
-                        // It's binary audio data (MP3 chunks from TTS)
-                        if (expectingAudio) {
-                            // Ensure data is a Blob for consistent handling
-                            const blobData = event.data instanceof ArrayBuffer ? new Blob([event.data], { type: 'audio/mpeg' }) : event.data;
-                            currentAudioChunks.push(blobData);
-                            console.log(`Received audio chunk. Current chunks total size: ${currentAudioChunks.reduce((sum, chunk) => sum + chunk.size, 0)} bytes`);
-
-                            // Reset the timeout. If no new chunks arrive within this time,
-                            // we assume the full audio has been received.
-                            if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
-                            audioChunkTimeout = setTimeout(async () => {
-                                if (expectingAudio && currentAudioChunks.length > 0) {
-                                    console.log("Audio chunk timeout. Assuming end of audio stream. Playing collected audio.");
-                                    const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mpeg' });
-                                    await playNextAudio(audioBlob);
-                                    expectingAudio = false; // Finished with this audio turn
-                                    currentAudioChunks = []; // Clear for next turn
-                                } else {
-                                    console.log("Audio chunk timeout, but no audio collected or not expecting.");
-                                }
-                            }, 200); // 200ms delay. Adjust if needed based on network conditions.
-                        } else {
-                            console.warn("Received unexpected audio chunk. Not currently expecting audio or already played.");
-                        }
+                    } else if (event.data instanceof Blob) {
+                        await playNextAudio(event.data);
                     }
                 };
 
                 ws.onclose = () => {
-                    console.log("WebSocket closed");
+                    console.log("WebSocket closed by server.");
                     startButton.disabled = false;
                     stopButton.disabled = true;
                     startButton.classList.remove('recording');
-                    if (audioChunkTimeout) clearTimeout(audioChunkTimeout); // Clear any pending audio timeouts
-                    currentAudioChunks = []; // Clear any residual chunks
-                    expectingAudio = false;
+                    if (audioContext && audioContext.state !== 'closed') {
+                        audioContext.close();
+                    }
                 };
 
                 ws.onerror = (error) => {
@@ -399,40 +393,23 @@ html = """
                     startButton.disabled = false;
                     stopButton.disabled = true;
                     startButton.classList.remove('recording');
-                    if (audioChunkTimeout) clearTimeout(audioChunkTimeout); // Clear any pending audio timeouts
-                    currentAudioChunks = []; // Clear any residual chunks
-                    expectingAudio = false;
                 };
             };
 
             stopButton.onclick = () => {
                 startButton.disabled = false;
                 stopButton.disabled = true;
-                startButton.classList.remove('recording'); // Remove recording style
+                startButton.classList.remove('recording');
 
                 if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send("END_OF_SPEECH"); // Signal end of speech to backend
-                    ws.close(); // Close WebSocket connection
+                    ws.send("END_OF_SPEECH");
                 }
-
-                // Stop media stream and disconnect audio nodes
+                
                 if (mediaStream) {
                     mediaStream.getTracks().forEach(track => track.stop());
                 }
-                if (processor) {
-                    processor.disconnect();
-                }
-                if (audioInput) {
-                    audioInput.disconnect();
-                }
-                if (audioContext) {
-                    audioContext.close();
-                }
-                
-                // Clear any pending audio processing on stop
-                if (audioChunkTimeout) clearTimeout(audioChunkTimeout);
-                currentAudioChunks = [];
-                expectingAudio = false;
+                if (processor) processor.disconnect();
+                if (audioInput) audioInput.disconnect();
             };
         </script>
     </body>
@@ -443,379 +420,251 @@ html = """
 async def get():
     return HTMLResponse(html)
 
+async def process_final_transcript(transcript_text: str, websocket: WebSocket, dialogflow_session_path: str):
+    logger.info(f"Processing final transcript: '{transcript_text}'")
 
-# --- Core WebSocket Endpoint ---
+    if not transcript_text.strip():
+        logger.info("Empty transcript, skipping processing.")
+        return
+
+    if websocket.client_state == WebSocketState.CONNECTED:
+        await websocket.send_text(f"You: {transcript_text}")
+    else:
+        logger.info("WebSocket disconnected, cannot send user transcript back to frontend.")
+        return
+
+    response_text = ""
+    try:
+        # 1. First, try Dialogflow for specific intents
+        # --- MODIFICATION 4: Await the async Dialogflow call ---
+        dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
+        
+        dialogflow_handled = False
+        # Improved check for Dialogflow handling the query
+        error_phrases = [
+            "I'm sorry, I couldn't process your request.",
+            "I didn't understand that.",
+            "I'm not sure how to respond to that.",
+            "I'm sorry, I'm having trouble with my understanding right now."
+        ]
+        # Check if the response is not a generic error and not the initial static text
+        if dialogflow_response and not any(phrase in dialogflow_response for phrase in error_phrases) and "Performing that calculation" not in dialogflow_response:
+            response_text = dialogflow_response
+            dialogflow_handled = True
+            logger.info(f"Dialogflow handled the query with final webhook response: {response_text}")
+        else:
+            logger.info(f"Dialogflow gave initial or error response: '{dialogflow_response}'. Falling back...")
+
+        
+        # 2. Fallback to RAG if Dialogflow didn't provide a specific answer
+        if not dialogflow_handled and retrieval_chain:
+            logger.info(f"Dialogflow did not provide a specific answer. Attempting RAG (semantic search)...")
+            try:
+                rag_result = await retrieval_chain.ainvoke({"input": transcript_text})
+                response_text = rag_result.get("answer", "I couldn't find a relevant answer in my documents.")
+                logger.info(f"RAG Chain (Semantic) Response: {response_text}")
+            except Exception as rag_e:
+                logger.error(f"Error during RAG chain (semantic) invocation: {rag_e}")
+                response_text = "I couldn't find information about that in my documents using semantic search."
+        elif not dialogflow_handled:
+            # If RAG is also not available, use the initial (potentially error) response from Dialogflow
+            response_text = dialogflow_response if dialogflow_response else "I'm not sure how to respond to that."
+
+
+    except Exception as e:
+        logger.error(f"Error during response generation (Dialogflow/RAG): {e}")
+        response_text = "I encountered an error trying to process your request."
+
+    if response_text:
+        logger.info(f"Final AI Response Text to be sent: {response_text}")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(response_text)
+            await stream_tts_and_send_to_client(response_text, websocket)
+    else:
+        logger.info("No AI response text generated.")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text("I'm sorry, I couldn't generate a response.")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established.")
 
-    # Variables to hold STT config. `stt_config_set` will signal when sample rate is received.
-    stt_sample_rate_hertz = 0 # Will be updated by frontend
-    stt_config_set = asyncio.Event() # Event to signal when STT config is ready
+    stt_sample_rate_hertz = 0
+    stt_config_set = asyncio.Event()
 
-    # Dialogflow session ID (unique per user conversation).
-    # Using client host and port for a basic unique ID for development.
     session_id = str(websocket.client.host) + "-" + str(websocket.client.port)
+    # The async client uses the same session_path method
     dialogflow_session_path = dialogflow_sessions_client.session_path(
         settings.GOOGLE_CLOUD_PROJECT_ID, session_id
     )
     logger.info(f"Dialogflow Session Path: {dialogflow_session_path}")
 
-    # Synchronous queue for STT requests. This bridges the async WebSocket
-    # with the synchronous `speech_client.streaming_recognize` call (run in a thread).
     sync_recognize_requests_queue = queue.Queue()
-    
-    # Asynchronous queue for STT results to be processed in the main event loop.
     stt_results_queue = asyncio.Queue()
 
-    # Flag to control streaming and task lifecycle
-    is_recording_active = True
-
     async def consume_audio_stream():
-        """
-        Consumes audio chunks from the WebSocket and puts them into a synchronous queue.
-        Also handles receiving the initial sample rate from the frontend.
-        """
-        nonlocal is_recording_active, stt_sample_rate_hertz
+        nonlocal stt_sample_rate_hertz
         try:
-            # Loop while recording is active AND the websocket is connected
-            while is_recording_active and websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    message = await websocket.receive()
-                except RuntimeError as e:
-                    logger.warning(f"WebSocket receive error (likely disconnect): {e}")
-                    is_recording_active = False
-                    break # Exit loop if receive fails due to disconnect
+            while websocket.client_state == WebSocketState.CONNECTED:
+                message = await websocket.receive()
                 
-                # Handle binary (audio) messages
                 if message["type"] == "websocket.receive" and "bytes" in message:
-                    audio_chunk = message["bytes"]
-                    if audio_chunk == b'END_OF_SPEECH': # Custom signal from frontend to stop recording
-                        logger.info("Received END_OF_SPEECH signal from client.")
-                        is_recording_active = False
-                        break # Exit loop
-                    
-                    # Wait until sample rate is set before putting audio into the queue for STT
                     await stt_config_set.wait()
-                    sync_recognize_requests_queue.put_nowait(speech.StreamingRecognizeRequest(audio_content=audio_chunk))
+                    sync_recognize_requests_queue.put_nowait(speech.StreamingRecognizeRequest(audio_content=message["bytes"]))
                 
-                # Handle text (JSON for sample rate, or other text) messages
                 elif message["type"] == "websocket.receive" and "text" in message:
+                    if message["text"] == "END_OF_SPEECH":
+                        logger.info("Received END_OF_SPEECH signal from client.")
+                        break
                     try:
                         data = json.loads(message["text"])
                         if data.get("type") == "sample_rate":
                             stt_sample_rate_hertz = int(data["value"])
                             logger.info(f"Received sample rate from frontend: {stt_sample_rate_hertz} Hz")
-                            stt_config_set.set() # Signal that STT config is ready
-                        # You can add more JSON message types here if needed
+                            stt_config_set.set()
                     except json.JSONDecodeError:
-                        # If it's not JSON, it might be the transcript echo from frontend (for React app)
                         logger.debug(f"Received non-JSON text message: {message['text']}")
-                        # If you want to display the user's transcript on the backend, you can do so here.
-                        # For the current setup, the frontend displays its own transcript.
         except WebSocketDisconnect:
             logger.info("Client disconnected during audio consumption.")
-            is_recording_active = False
         except Exception as e:
             logger.error(f"Error consuming audio stream: {e}")
-            is_recording_active = False
         finally:
-            # Crucial: Signal end of input to the synchronous generator for STT
             sync_recognize_requests_queue.put_nowait(None)
 
-
     def synchronous_request_generator():
-        """
-        A synchronous generator that pulls from the synchronous queue.
-        This generator will be consumed by `speech_client.streaming_recognize`.
-        """
         while True:
-            # This `get()` call will block the thread until an item is available
-            # or the sentinel `None` is put into the queue.
             request = sync_recognize_requests_queue.get()
-            if request is None: # Sentinel value to signal end of stream
+            if request is None:
                 break
             yield request
 
     async def transcribe_speech():
-        """
-        Handles the Speech-to-Text transcription.
-        Runs the synchronous `speech_client.streaming_recognize` in a separate thread.
-        """
-        nonlocal is_recording_active # Need to be able to set this to False on error
-
         try:
-            # Wait for the sample rate to be set by the frontend before configuring STT
             await stt_config_set.wait()
 
-            # Create STT config with the received sample rate
             config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, # Raw PCM, 16-bit, mono
-                sample_rate_hertz=stt_sample_rate_hertz, # Use the dynamic sample rate from frontend
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=stt_sample_rate_hertz,
                 language_code="en-US",
                 enable_automatic_punctuation=True,
             )
             streaming_config = speech.StreamingRecognitionConfig(
                 config=config,
-                interim_results=False, # Set to True if you want partial results
-                single_utterance=True, # Stop processing after user stops speaking
+                interim_results=False, 
             )
 
-            # Define a synchronous function to run in a separate thread
             def _run_stt_synchronously() -> List[str]:
-                """
-                Synchronous function to run STT in a separate thread.
-                Collects all final transcripts and returns them.
-                """
                 logger.info("Starting synchronous STT recognition in a new thread.")
                 collected_transcripts = []
                 try:
-                    # This call returns a synchronous iterator
                     responses_sync_iterator = speech_client.streaming_recognize(
                         streaming_config, synchronous_request_generator()
                     )
-                    
                     for response in responses_sync_iterator:
                         for result in response.results:
                             if result.alternatives:
-                                transcript_text = result.alternatives[0].transcript
-                                logger.info(f"STT Final Transcript (from thread): {transcript_text}")
-                                collected_transcripts.append(transcript_text)
-                                if result.is_final:
-                                    # For single_utterance=True, we expect one final result per user turn.
-                                    return collected_transcripts # Exit synchronous loop and return
+                                collected_transcripts.append(result.alternatives[0].transcript)
                 except Exception as e:
                     logger.error(f"Error within synchronous STT thread: {e}")
                 finally:
                     logger.info("Synchronous STT thread finished.")
-                    return collected_transcripts # Ensure transcripts are returned even on error
+                    return collected_transcripts
 
-            # Run the synchronous STT function in a separate thread
             final_transcripts = await asyncio.to_thread(_run_stt_synchronously)
             logger.info(f"STT processing task completed. Final transcripts: {final_transcripts}")
 
-            # Put collected final transcripts into the async queue for main loop processing
             for transcript_text in final_transcripts:
                 await stt_results_queue.put(transcript_text)
-            await stt_results_queue.put(None) # Sentinel to signal end of this utterance's results
+            await stt_results_queue.put(None)
 
         except Exception as e:
             logger.error(f"Error during speech transcription task setup/execution: {e}")
-            is_recording_active = False # Ensure recording stops if STT fails
-            # Also signal error/end to the STT results queue
             await stt_results_queue.put(None)
 
-    async def process_stt_results():
-        """
-        Consumes final STT transcripts from the queue and processes them.
-        """
-        nonlocal is_recording_active
+    async def process_stt_results_consumer():
         try:
-            while is_recording_active: # Loop while recording is active
+            while True:
                 transcript_text = await stt_results_queue.get()
-                if transcript_text is None: # Sentinel for end of utterance
-                    logger.info("Received STT results sentinel, stopping processing for this turn.")
-                    # This break will exit the while loop for the current turn.
-                    # The outer try/finally or task cancellation will handle full shutdown.
+                if transcript_text is None:
+                    logger.info("Received STT results sentinel, stopping processing.")
                     break 
                 
-                # Check if WebSocket is still connected before processing and sending response
                 if websocket.client_state == WebSocketState.CONNECTED:
-                    await process_final_transcript(transcript_text)
+                    await process_final_transcript(transcript_text, websocket, dialogflow_session_path)
                 else:
-                    logger.info("WebSocket disconnected, skipping processing of STT results.")
-                    is_recording_active = False # Ensure loop terminates if client disconnected
+                    logger.warning("WebSocket disconnected while trying to process STT results.")
                     break
         except Exception as e:
             logger.error(f"Error processing STT results: {e}")
-            is_recording_active = False # Stop if error occurs
         finally:
             logger.info("STT results processing task finished.")
-            # Ensure the queue is marked as done for the current task, if it was consuming.
-            # This is more for graceful shutdown of the queue itself if it were persistent.
 
-    async def process_final_transcript(transcript_text: str):
-        """
-        Processes the final transcribed text by sending it to Dialogflow (or Gemini directly).
-        Then triggers TTS to speak the AI's response.
-        """
-        logger.info(f"Processing final transcript: '{transcript_text}'")
+    consumer_task = asyncio.create_task(consume_audio_stream())
+    transcribe_task = asyncio.create_task(transcribe_speech())
+    processor_task = asyncio.create_task(process_stt_results_consumer())
 
-        if not transcript_text.strip():
-            logger.info("Empty transcript, skipping LLM/Dialogflow.")
-            return
-
-        # Send transcript back to frontend for display (this ensures it's shown after processing)
-        # Only send if the websocket is still connected
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(f"You: {transcript_text}")
-        else:
-            logger.info("WebSocket disconnected, cannot send user transcript back to frontend.")
-            return # Exit early if disconnected
-
-        # --- Option 1: Direct LLM (Gemini) Call (uncomment to use) ---
-        # response_text = await get_gemini_response(transcript_text)
-
-        # --- Option 2: Dialogflow Integration (Recommended for structure) ---
-        response_text = await get_dialogflow_response(transcript_text, dialogflow_session_path)
-
-        if response_text:
-            logger.info(f"AI Response Text: {response_text}")
-            # Only stream TTS if the websocket is still connected
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await stream_tts_and_send_to_client(response_text)
-            else:
-                logger.info("WebSocket disconnected, cannot stream TTS audio.")
-        else:
-            logger.info("No AI response text generated.")
-            # Only send error message if the websocket is still connected
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text("I'm sorry, I couldn't generate a response.")
-
-
-    async def get_gemini_response(prompt: str) -> str:
-        """
-        Calls the Gemini LLM directly using the async client from Vertex AI.
-        For conversational memory, you would pass previous messages to the LLM's history.
-        """
-        if not gemini_model:
-            logger.error("Gemini model not initialized.")
-            return "AI model not initialized."
-        try:
-            # Using generate_content_async for asynchronous call
-            response = await gemini_model.generate_content_async(
-                prompt,
-                generation_config=gemini_config,
-                # Example for conversational memory (add your chat history here):
-                # history=[
-                #     {'role':'user', 'parts': ["Hello"]},
-                #     {'role':'model', 'parts': ["Hi there! How can I help you today?"]},
-                #     ...
-                # ]
-            )
-            # Access the text from the response safely
-            return response.candidates[0].content.parts[0].text
-        except Exception as e:
-            logger.error(f"Error calling Gemini LLM: {e}")
-            return "I'm sorry, I'm having trouble connecting to the AI at the moment."
-
-    async def get_dialogflow_response(text: str, session_path: str) -> str:
-        """
-        Sends text to Dialogflow and gets a response.
-        """
-        query_input = dialogflow.QueryInput(text=dialogflow.TextInput(text=text, language_code="en-US"))
-        try:
-            # Wrap the synchronous Dialogflow call in asyncio.to_thread
-            response = await asyncio.to_thread(
-                dialogflow_sessions_client.detect_intent, session=session_path, query_input=query_input
-            )
-            logger.info(f"Dialogflow Raw Response: {response}") # Log raw Dialogflow response
-            logger.info(f"Dialogflow Query Result: {response.query_result.fulfillment_text}")
-            # Dialogflow's fulfillment_text is the response to send to the user.
-            # If Dialogflow triggers a webhook to your backend, your webhook logic
-            # would handle the more complex response generation.
-            return response.query_result.fulfillment_text
-        except Exception as e:
-            logger.error(f"Error calling Dialogflow: {e}")
-            return "I'm sorry, I'm having trouble with my understanding right now."
-
-
-    async def stream_tts_and_send_to_client(text: str):
-        """
-        Generates speech from text using Google Cloud Text-to-Speech and streams audio back to the client.
-        Note: Google Cloud TTS `synthesize_speech` is a synchronous call that returns the full audio blob.
-        We simulate streaming by chunking and sending. For true streaming TTS, a different API/approach is needed.
-        """
-        synthesis_input = tts.SynthesisInput(text=text)
-        voice = tts.VoiceSelectionParams(
-            language_code="en-US",
-            ssml_gender=tts.SsmlVoiceGender.FEMALE, # Changed from NEUTRAL to FEMALE
-            name="en-US-Wavenet-F" # Changed from Neural2-C to a common Wavenet voice
-        )
-        audio_config = tts.AudioConfig(
-            audio_encoding=tts.AudioEncoding.LINEAR16, # Raw PCM, 16-bit, mono
-            sample_rate_hertz=16000 # Important: Match this with frontend audio playback!
-        )
-
-        try:
-            # Perform synchronous TTS synthesis in a separate thread to avoid blocking the event loop
-            response = await asyncio.to_thread(
-                tts_client.synthesize_speech, input=synthesis_input, voice=voice, audio_config=audio_config
-            )
-            audio_content = response.audio_content
-
-            # Send the AI's text response first to the frontend
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text(text)
-            else:
-                logger.info("WebSocket disconnected, cannot send AI text back to frontend.")
-                return
-
-            # Chunk the audio and send it over the WebSocket
-            chunk_size = 4096 # Adjust as needed for smoother streaming vs. network overhead
-            for i in range(0, len(audio_content), chunk_size):
-                chunk = audio_content[i:i + chunk_size]
-                # Check if the client is still connected before sending
-                if websocket.client_state == WebSocketState.CONNECTED:
-                    await websocket.send_bytes(chunk)
-                else:
-                    logger.info("WebSocket disconnected during TTS streaming, stopping audio.")
-                    break # Stop streaming if client disconnects
-                await asyncio.sleep(0.001) # Small delay to yield control and allow other tasks to run
-            logger.info("TTS audio streamed to client.")
-
-        except Exception as e:
-            logger.error(f"Error during TTS generation/streaming: {e}")
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text("I'm sorry, I can't speak right now.")
-
-    # --- Main WebSocket Task Orchestration ---
     try:
-        # Create the audio consumer task (receives from frontend, puts into sync queue)
-        audio_consumer_task = asyncio.create_task(consume_audio_stream())
-        
-        # Create the transcription task (pulls from sync queue, calls STT, processes response)
-        transcribe_task = asyncio.create_task(transcribe_speech())
-
-        # Create the STT results processing task (consumes from async queue, calls LLM/Dialogflow, TTS)
-        stt_results_processor_task = asyncio.create_task(process_stt_results())
-
-        # Wait for all tasks to complete, or for a WebSocketDisconnect
-        # We explicitly don't use FIRST_COMPLETED here to allow tasks to finish their work.
-        # The `is_recording_active` flag and `None` sentinels are key for graceful exits.
-        await asyncio.gather(
-            audio_consumer_task,
-            transcribe_task,
-            stt_results_processor_task,
-            return_exceptions=True # Allow tasks to fail without stopping gather immediately
-        )
-
-        logger.info("All WebSocket tasks completed.")
-
-    except WebSocketDisconnect:
-        logger.info("Client disconnected gracefully.")
+        await asyncio.gather(consumer_task, transcribe_task, processor_task)
     except Exception as e:
-        logger.error(f"WebSocket endpoint encountered an unexpected error: {e}")
+        logger.error(f"An error occurred in websocket_endpoint: {e}")
     finally:
-        # This `finally` block ensures cleanup when the `websocket_endpoint` coroutine exits.
-        # It's crucial to set `is_recording_active = False` here to signal all tasks to stop.
-        is_recording_active = False 
-        # Also, ensure the synchronous queue is signaled to prevent its thread from hanging.
-        # This is important if consume_audio_stream or transcribe_speech were still running.
-        try:
-            sync_recognize_requests_queue.put_nowait(None)
-        except queue.Full:
-            pass # Ignore if queue is full during shutdown
-        
-        # And the async queue for results
-        try:
-            stt_results_queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass # Ignore if queue is full during shutdown
-        
-        # Finally, close the websocket. This should be the last step.
-        # Check if the websocket is still connected before attempting to close,
-        # to avoid the "Unexpected ASGI message 'websocket.close'" error.
+        for task in [consumer_task, transcribe_task, processor_task]:
+            if not task.done():
+                task.cancel()
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close()
+        logger.info("WebSocket connection closed and tasks cleaned up.")
+
+# --- MODIFICATION 3: Convert helper function to async ---
+async def get_dialogflow_response(transcript_text: str, session_path: str) -> str:
+    """Asynchronous function to get a response from Dialogflow."""
+    if dialogflow_sessions_client is None:
+        logger.error("Dialogflow client not initialized.")
+        return "I'm sorry, my Dialogflow service is not ready."
+
+    text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
+    query_input = dialogflow.QueryInput(text=text_input)
+
+    try:
+        # Use await with the async client. This call now waits for the webhook to complete.
+        response = await dialogflow_sessions_client.detect_intent(
+            session=session_path, query_input=query_input
+        )
+        # The fulfillment_text will now contain the final response from the webhook.
+        return response.query_result.fulfillment_text
+    except GoogleAPIError as e:
+        logger.error(f"Dialogflow API error: {e}")
+        return "I'm sorry, I'm having trouble connecting to my understanding service right now."
+    except Exception as e:
+        logger.error(f"Error detecting intent with Dialogflow: {e}")
+        return "I'm sorry, I'm having trouble with my understanding right now."
+
+async def stream_tts_and_send_to_client(text_to_synthesize: str, websocket: WebSocket):
+    """Synthesizes text to speech and sends it over the WebSocket."""
+    if tts_client is None:
+        logger.error("TTS client not initialized.")
+        return
+
+    synthesis_input = tts.SynthesisInput(text=text_to_synthesize)
+    voice = tts.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-C")
+    audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
+
+    try:
+        # This is a blocking (synchronous) call, so we run it in a thread
+        # to avoid blocking the asyncio event loop.
+        response = await asyncio.to_thread(
+            tts_client.synthesize_speech,
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        audio_bytes = response.audio_content
+
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_bytes(audio_bytes)
+            logger.info(f"Sent {len(audio_bytes)} bytes of TTS audio.")
+        else:
+            logger.warning("WebSocket disconnected, unable to send TTS audio.")
+
+    except Exception as e:
+        logger.error(f"Error during TTS synthesis or sending audio: {e}")
