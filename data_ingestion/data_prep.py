@@ -64,7 +64,7 @@ if __name__ == "__main__":
     texts = text_splitter.split_documents(my_documents)
     print(f"Split {len(my_documents)} documents into {len(texts)} chunks.")
 
-    embeddings = VertexAIEmbeddings(model="text-embedding-004")
+    embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
 
     vectorstore = Chroma.from_documents(
         documents=texts,
