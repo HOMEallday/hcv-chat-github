@@ -24,7 +24,7 @@ from google.api_core.exceptions import GoogleAPIError
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain_chroma import Chroma
@@ -70,21 +70,22 @@ async def lifespan(app: FastAPI):
         dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
         logger.info("Google Cloud clients (Speech, TTS, Dialogflow Async) initialized successfully.")
 
-        # Initialize Vertex AI for Gemini models (MOVED HERE)
+        # Initialize Vertex AI for Gemini models 
         vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID, location="us-central1")
         logger.info(f"Vertex AI initialized for project: {settings.GOOGLE_CLOUD_PROJECT_ID}, location: us-central1")
 
-        # Your original Vertex AI GenerativeModel instance (MOVED HERE)
-        gemini_model = GenerativeModel('gemini-1.5-pro')
-        logger.info("Gemini model ('gemini-1.5-pro') initialized via Vertex AI.")
+        # Your original Vertex AI GenerativeModel instance
+        MODEL_NAME = "gemini-2.5-flash"
+        gemini_model = GenerativeModel(MODEL_NAME, generation_config=GenerationConfig(temperature=0.7, top_p=0.9, top_k=40))
+        logger.info(f"Gemini model ('{MODEL_NAME}') initialized via Vertex AI.")
 
         # --- LangChain-compatible Gemini model for RAG ---
-        gemini_llm = ChatVertexAI(model_name="gemini-1.5-pro", temperature=0.0) # Lower temp for RAG
+        gemini_llm = ChatVertexAI(model_name=MODEL_NAME, temperature=0.0) # Lower temp for RAG
         logger.info("LangChain ChatVertexAI (gemini_llm) initialized for RAG.")
 
-        # --- NEW ADDITION FOR RAG: RAG Component Initialization ---
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001") # Using a common embedding model name
-        logger.info("GoogleGenerativeAIEmbeddings (from langchain_google_genai) initialized for RAG.")
+        # --- RAG Component Initialization ---
+        embeddings = VertexAIEmbeddings(model_name="text-embedding-005") 
+        logger.info("VertexAIEmbeddings initialized for RAG.")
 
 
         # Adjust this path based on your *exact* directory structure:
@@ -436,13 +437,22 @@ async def process_final_transcript(transcript_text: str, websocket: WebSocket, d
     response_text = ""
     try:
         # 1. First, try Dialogflow for specific intents
-        # --- MODIFICATION 4: Await the async Dialogflow call ---
         dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
         
         dialogflow_handled = False
         # Improved check for Dialogflow handling the query
         error_phrases = [
-            "I'm sorry, I couldn't process your request.",
+            "Can you say that again?",
+            "I didn't get that. Can you say it again?",
+            "Sorry, what was that?",
+            "Sorry, can you say that again?",
+            "I missed what you said. What was that?",
+            "One more time?",
+            "What was that?",
+            "Say that one more time?",
+            "I'm sorry, I didn't get that.",
+            "I'm sorry, can you repeat that?",
+            "I'm sorry, I couldn't process your request.", # Your original phrases
             "I didn't understand that.",
             "I'm not sure how to respond to that.",
             "I'm sorry, I'm having trouble with my understanding right now."
@@ -458,7 +468,7 @@ async def process_final_transcript(transcript_text: str, websocket: WebSocket, d
         
         # 2. Fallback to RAG if Dialogflow didn't provide a specific answer
         if not dialogflow_handled and retrieval_chain:
-            logger.info(f"Dialogflow did not provide a specific answer. Attempting RAG (semantic search)...")
+            logger.info(f"Dialogflow did not provide a specific answer. Attempting RAG (semantic search)...\n.\n.\n.\n.\n")
             try:
                 rag_result = await retrieval_chain.ainvoke({"input": transcript_text})
                 response_text = rag_result.get("answer", "I couldn't find a relevant answer in my documents.")
