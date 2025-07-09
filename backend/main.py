@@ -9,6 +9,7 @@ from starlette.websockets import WebSocketState
 from enum import Enum
 from typing import AsyncGenerator, List, Optional, Dict, Any
 from contextlib import asynccontextmanager
+import re
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -544,7 +545,7 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
 
     response_text = ""
     if current_state == AppState.INTRODUCTION:
-        user_name = transcript.strip() if transcript.strip() else "there"
+        user_name = extract_name(transcript)
         response_text = f"It's nice to meet you, {user_name}! Let's get started with our lesson."
         await websocket.send_json({"type": "ai_response", "text": response_text})
         await stream_tts_and_send_to_client(response_text, websocket)
@@ -719,3 +720,28 @@ async def transcribe_speech_utterance(audio_input_queue: asyncio.Queue, stt_resu
             break
     
     await stt_thread
+
+def extract_name(transcript: str) -> str:
+    """
+    Extracts a name from an introductory sentence using pattern matching.
+    """
+    if not transcript:
+        return "there"
+
+    # Pattern 1: Look for phrases like "my name is [Name]", "I'm [Name]", etc.
+    # This looks for a capitalized word after the introductory phrase.
+    match = re.search(r"(?:my name is|I'm|I am)\s+([A-Z]\w+)", transcript, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    # Fallback Pattern 2: If no specific phrase is found, assume the last word is the name.
+    # This handles cases like "It's Ethan" or just saying the name "Ethan".
+    words = transcript.strip().split()
+    if words:
+        potential_name = words[-1].strip(".,!?") # Remove trailing punctuation
+        # A simple check to avoid using a common greeting as a name
+        if potential_name.lower() not in ["hello", "hi", "hey"]:
+            return potential_name
+
+    # If all else fails, use a friendly default.
+    return "there"
