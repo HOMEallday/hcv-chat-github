@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 from starlette.websockets import WebSocketState
+from enum import Enum
 from typing import AsyncGenerator, List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -38,16 +39,24 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # Initialize global variables for clients and models
 speech_client = None
 tts_client = None
 dialogflow_sessions_client = None # This will now be an Async client
 gemini_model = None
-
-# Global variables for RAG components
 vectorstore: Optional[Chroma] = None
 retrieval_chain = None
 gemini_llm: Optional[ChatVertexAI] = None
+
+# Define application states for managing conversation flow
+class AppState(Enum):
+    IDLE = "IDLE"
+    INTRODUCTION = "INTRODUCTION"
+    LESSON_DELIVERY = "LESSON_DELIVERY"
+    LESSON_PAUSED = "LESSON_PAUSED"
+    QNA = "QNA"
+    QUIZ = "QUIZ"
 
 #Define lifespan context manager ---
 @asynccontextmanager
@@ -110,7 +119,17 @@ async def lifespan(app: FastAPI):
 
                 # Define the RAG prompt
                 rag_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "You are an AI assistant. Use the following context to answer the user's question. If the question cannot be answered from the context, state that you don't have enough information.\n\nContext:\n{context}"),
+                    ("system", """You are an AI assistant for housing policies. Use the following context to answer the user's question.
+                     
+**Instructions:**
+- Provide a concise, conversational summary.
+- **You must not use any markdown formatting.** This includes never using asterisks (*) for lists.
+- Present lists naturally within a sentence. For example, instead of saying "* Item one * Item two", you should say "The policy includes item one, item two, and item three."
+- Prioritize your answer to be brief. Only provide a detailed, multi-point summary if the user explicitly asks for "details" or a "detailed summary".
+- If the question cannot be answered from the context, state that you don't have enough information.
+
+**Context:**
+{context}"""),
                     ("user", "{input}")
                 ])
 
@@ -268,364 +287,359 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
 html = """
 <!DOCTYPE html>
 <html>
-    <head>
-        <title>FastAPI WebSocket Chat</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            button { padding: 10px 20px; font-size: 1em; margin: 5px; cursor: pointer; }
-            #transcript, #aiResponse {
-                margin-top: 20px;
-                padding: 15px;
-                border: 1px solid #ccc;
-                border-radius: 8px;
-                background-color: #f9f9f9;
-                min-height: 50px;
+<head>
+    <title>HCV Trainer</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f2f5; }
+        #chat-container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; }
+        .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; }
+        .user-message { background-color: #0084ff; color: white; text-align: left; margin-left: auto; }
+        .ai-message { background-color: #e4e6eb; color: #050505; text-align: left; margin-right: auto; }
+        #controls, #status-bar { text-align: center; margin-top: 20px; }
+        button { padding: 10px 20px; font-size: 1em; margin: 5px; cursor: pointer; border-radius: 20px; border: none; background-color: #0084ff; color: white; }
+        button:disabled { background-color: #a0a0a0; cursor: not-allowed; }
+        #status { font-weight: bold; color: #333; }
+        #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 10px; }
+        #mic-indicator.listening { background-color: #e74c3c; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); } 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); } }
+    </style>
+</head>
+<body>
+    <div id="chat-container"><div id="conversation"></div></div>
+    <div id="status-bar">Current State: <span id="status">Connecting...</span> Mic: <span id="mic-indicator"></span></div>
+    <div id="controls">
+        <button id="pauseButton" style="display: none;">Pause Lesson</button>
+        <button id="resumeButton" style="display: none;">Resume Lesson</button>
+        <button id="talkButton">Push to Talk</button>
+    </div>
+    <script>
+    const conversationDiv = document.getElementById('conversation');
+    const statusSpan = document.getElementById('status');
+    const micIndicator = document.getElementById('mic-indicator');
+    const pauseButton = document.getElementById('pauseButton');
+    const resumeButton = document.getElementById('resumeButton');
+    const talkButton = document.getElementById('talkButton');
+
+    let ws;
+    let mediaStream;
+    let audioContext;
+    let processor;
+    let isListening = false;
+    let audioQueue = [];
+    let isPlaying = false;
+
+    function connect() {
+        ws = new WebSocket(`ws://${window.location.host}/ws`);
+        ws.onopen = () => console.log("WebSocket connected.");
+        ws.onclose = () => {
+            console.log("WebSocket disconnected.");
+            statusSpan.textContent = "Disconnected";
+            if (isListening) stopListening();
+        };
+        ws.onerror = (error) => console.error("WebSocket Error:", error);
+
+        ws.onmessage = (event) => {
+            if (typeof event.data === 'string') {
+                handleTextMessage(JSON.parse(event.data));
+            } else if (event.data instanceof Blob) {
+                audioQueue.push(event.data);
+                if (!isPlaying) playNextAudio();
             }
-            #aiResponse { border-color: #2980b9; background-color: #e8f6ff; }
-            .recording { background-color: #e74c3c; color: white; }
-        </style>
-    </head>
-    <body>
-        <h1>WebSocket Chat</h1>
-        <button id="startButton">Start Recording</button>
-        <button id="stopButton" disabled>Stop Recording</button>
-        <div id="transcript"><strong>You:</strong></div>
-        <div id="aiResponse"><strong>AI:</strong></div>
-        <script>
-            const startButton = document.getElementById('startButton');
-            const stopButton = document.getElementById('stopButton');
-            const transcriptDiv = document.getElementById('transcript');
-            const aiResponseDiv = document.getElementById('aiResponse');
+        };
+    }
 
-            let ws;
-            let mediaStream;
-            let audioContext;
-            let audioInput;
-            let processor;
-            let currentSampleRate;
+    function handleTextMessage(message) {
+        if (message.type === 'state_update') {
+            updateUIForState(message.state);
+        } else if (message.type === 'ai_response') {
+            addMessage(message.text, 'ai');
+        } else if (message.type === 'user_transcript') {
+            addMessage(message.text, 'user');
+        }
+    }
 
-            async function playNextAudio(audioBlob) {
-                if (!audioBlob || audioBlob.size === 0) {
-                    console.warn("Attempted to play empty audio blob.");
-                    return;
-                }
-                const audioUrl = URL.createObjectURL(audioBlob);
-                const audio = new Audio(audioUrl);
-                audio.onended = () => URL.revokeObjectURL(audioUrl);
-                audio.onerror = (e) => console.error('Audio playback error:', e);
-                try {
-                    await audio.play();
-                } catch (error) {
-                    console.error("Error attempting to play audio:", error);
-                }
+    function updateUIForState(state) {
+        statusSpan.textContent = state;
+        pauseButton.style.display = (state === 'LESSON_DELIVERY') ? 'inline-block' : 'none';
+        resumeButton.style.display = (state === 'LESSON_PAUSED') ? 'inline-block' : 'none';
+        const isConversational = ['INTRODUCTION', 'QNA', 'QUIZ', 'LESSON_PAUSED'].includes(state);
+        talkButton.disabled = isPlaying || !isConversational;
+    }
+
+    function addMessage(text, sender) {
+        const messageElem = document.createElement('div');
+        messageElem.classList.add('message', `${sender}-message`);
+        messageElem.textContent = text;
+        conversationDiv.appendChild(messageElem);
+        conversationDiv.scrollTop = conversationDiv.scrollHeight;
+    }
+
+    async function playNextAudio() {
+        if (audioQueue.length === 0) {
+            isPlaying = false;
+            updateUIForState(statusSpan.textContent);
+            return;
+        }
+        isPlaying = true;
+        updateUIForState(statusSpan.textContent);
+
+        const audioBlob = audioQueue.shift();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+
+        audio.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            playNextAudio();
+        };
+        audio.onerror = (e) => {
+            console.error('Audio playback error:', e);
+            isPlaying = false;
+            updateUIForState(statusSpan.textContent);
+        };
+        try {
+            await audio.play();
+        } catch (error) {
+            console.error("Error playing audio:", error);
+            isPlaying = false;
+            updateUIForState(statusSpan.textContent);
+        }
+    }
+
+    async function startListening() {
+        if (isListening || !ws || ws.readyState !== WebSocket.OPEN) return;
+        
+        // --- FIX: Unlock browser audio on the first user interaction ---
+        if (!audioContext || audioContext.state === 'suspended') {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            await audioContext.resume();
+        }
+        
+        isListening = true;
+        micIndicator.classList.add('listening');
+        ws.send(JSON.stringify({ type: 'control', command: 'start_speech' }));
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000 } });
+        const audioInput = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (event) => {
+            const inputData = event.inputBuffer.getChannelData(0);
+            const int16Array = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+                int16Array[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
             }
+            if (ws.readyState === WebSocket.OPEN) ws.send(int16Array.buffer);
+        };
+        audioInput.connect(processor);
+        processor.connect(audioContext.destination);
+    }
 
-            startButton.onclick = async () => {
-                startButton.disabled = true;
-                stopButton.disabled = false;
-                transcriptDiv.innerHTML = '<strong>You:</strong> ';
-                aiResponseDiv.innerHTML = '<strong>AI:</strong> ';
-                startButton.classList.add('recording');
+    function stopListening() {
+        if (!isListening) return;
+        isListening = false;
+        micIndicator.classList.remove('listening');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'control', command: 'end_speech' }));
+        }
+        if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+        if (processor) processor.disconnect();
+    }
 
-                ws = new WebSocket("ws://localhost:8000/ws");
+    talkButton.onmousedown = startListening;
+    talkButton.onmouseup = stopListening;
+    pauseButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'pause_lesson' }));
+    resumeButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'resume_lesson' }));
 
-                ws.onopen = () => {
-                    console.log("WebSocket opened");
-                    navigator.mediaDevices.getUserMedia({ audio: true })
-                        .then(stream => {
-                            mediaStream = stream;
-                            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                            currentSampleRate = audioContext.sampleRate;
-                            console.log("AudioContext sample rate:", currentSampleRate);
-
-                            if (ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({ type: 'sample_rate', value: currentSampleRate }));
-                            }
-
-                            audioInput = audioContext.createMediaStreamSource(mediaStream);
-                            processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                            processor.onaudioprocess = (event) => {
-                                const inputData = event.inputBuffer.getChannelData(0);
-                                const int16Array = new Int16Array(inputData.length);
-                                for (let i = 0; i < inputData.length; i++) {
-                                    int16Array[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-                                }
-                                if (ws.readyState === WebSocket.OPEN) {
-                                    ws.send(int16Array.buffer);
-                                }
-                            };
-                            audioInput.connect(processor);
-                            processor.connect(audioContext.destination);
-                        })
-                        .catch(err => {
-                            console.error("Error accessing microphone:", err);
-                            startButton.disabled = false;
-                            stopButton.disabled = true;
-                            startButton.classList.remove('recording');
-                            alert("Microphone access denied or error: " + err.message);
-                        });
-                };
-
-                ws.onmessage = async (event) => {
-                    if (typeof event.data === 'string') {
-                        if (event.data.startsWith("You:")) {
-                            transcriptDiv.textContent = event.data;
-                        } else {
-                            aiResponseDiv.innerHTML = `<strong>AI:</strong> ${event.data}`;
-                        }
-                    } else if (event.data instanceof Blob) {
-                        await playNextAudio(event.data);
-                    }
-                };
-
-                ws.onclose = () => {
-                    console.log("WebSocket closed by server.");
-                    startButton.disabled = false;
-                    stopButton.disabled = true;
-                    startButton.classList.remove('recording');
-                    if (audioContext && audioContext.state !== 'closed') {
-                        audioContext.close();
-                    }
-                };
-
-                ws.onerror = (error) => {
-                    console.error("WebSocket Error:", error);
-                    startButton.disabled = false;
-                    stopButton.disabled = true;
-                    startButton.classList.remove('recording');
-                };
-            };
-
-            stopButton.onclick = () => {
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                startButton.classList.remove('recording');
-
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send("END_OF_SPEECH");
-                }
-                
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop());
-                }
-                if (processor) processor.disconnect();
-                if (audioInput) audioInput.disconnect();
-            };
-        </script>
-    </body>
+    connect();
+    </script>
+</body>
 </html>
 """
+
 
 @app.get("/")
 async def get():
     return HTMLResponse(html)
-
-async def process_final_transcript(transcript_text: str, websocket: WebSocket, dialogflow_session_path: str):
-    logger.info(f"Processing final transcript: '{transcript_text}'")
-
-    if not transcript_text.strip():
-        logger.info("Empty transcript, skipping processing.")
-        return
-
-    if websocket.client_state == WebSocketState.CONNECTED:
-        await websocket.send_text(f"You: {transcript_text}")
-    else:
-        logger.info("WebSocket disconnected, cannot send user transcript back to frontend.")
-        return
-
-    response_text = ""
-    try:
-        # 1. First, try Dialogflow for specific intents
-        dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
-        
-        dialogflow_handled = False
-        # Improved check for Dialogflow handling the query
-        error_phrases = [
-            "Can you say that again?",
-            "I didn't get that. Can you say it again?",
-            "Sorry, what was that?",
-            "Sorry, can you say that again?",
-            "I missed what you said. What was that?",
-            "One more time?",
-            "What was that?",
-            "Say that one more time?",
-            "I'm sorry, I didn't get that.",
-            "I'm sorry, can you repeat that?",
-            "I'm sorry, I couldn't process your request.", # Your original phrases
-            "I didn't understand that.",
-            "I'm not sure how to respond to that.",
-            "I'm sorry, I'm having trouble with my understanding right now."
-        ]
-        # Check if the response is not a generic error and not the initial static text
-        if dialogflow_response and not any(phrase in dialogflow_response for phrase in error_phrases) and "Performing that calculation" not in dialogflow_response:
-            response_text = dialogflow_response
-            dialogflow_handled = True
-            logger.info(f"Dialogflow handled the query with final webhook response: {response_text}")
-        else:
-            logger.info(f"Dialogflow gave initial or error response: '{dialogflow_response}'. Falling back...")
-
-        
-        # 2. Fallback to RAG if Dialogflow didn't provide a specific answer
-        if not dialogflow_handled and retrieval_chain:
-            logger.info(f"Dialogflow did not provide a specific answer. Attempting RAG (semantic search)...\n.\n.\n.\n.\n")
-            try:
-                rag_result = await retrieval_chain.ainvoke({"input": transcript_text})
-                response_text = rag_result.get("answer", "I couldn't find a relevant answer in my documents.")
-                logger.info(f"RAG Chain (Semantic) Response: {response_text}")
-            except Exception as rag_e:
-                logger.error(f"Error during RAG chain (semantic) invocation: {rag_e}")
-                response_text = "I couldn't find information about that in my documents using semantic search."
-        elif not dialogflow_handled:
-            # If RAG is also not available, use the initial (potentially error) response from Dialogflow
-            response_text = dialogflow_response if dialogflow_response else "I'm not sure how to respond to that."
-
-
-    except Exception as e:
-        logger.error(f"Error during response generation (Dialogflow/RAG): {e}")
-        response_text = "I encountered an error trying to process your request."
-
-    if response_text:
-        logger.info(f"Final AI Response Text to be sent: {response_text}")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(response_text)
-            await stream_tts_and_send_to_client(response_text, websocket)
-    else:
-        logger.info("No AI response text generated.")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text("I'm sorry, I couldn't generate a response.")
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established.")
 
-    stt_sample_rate_hertz = 0
-    stt_config_set = asyncio.Event()
+    current_state = AppState.IDLE
+    session_id = f"{websocket.client.host}-{websocket.client.port}"
+    # This path is now created but only used if you call RAG/Dialogflow
+    dialogflow_session_path = "placeholder" # Simplified for now
 
-    session_id = str(websocket.client.host) + "-" + str(websocket.client.port)
-    # The async client uses the same session_path method
-    dialogflow_session_path = dialogflow_sessions_client.session_path(
-        settings.GOOGLE_CLOUD_PROJECT_ID, session_id
-    )
-    logger.info(f"Dialogflow Session Path: {dialogflow_session_path}")
+    transcription_task = None
+    audio_input_queue = None
 
-    sync_recognize_requests_queue = queue.Queue()
-    stt_results_queue = asyncio.Queue()
-
-    async def consume_audio_stream():
-        nonlocal stt_sample_rate_hertz
-        try:
-            while websocket.client_state == WebSocketState.CONNECTED:
-                message = await websocket.receive()
-                
-                if message["type"] == "websocket.receive" and "bytes" in message:
-                    await stt_config_set.wait()
-                    sync_recognize_requests_queue.put_nowait(speech.StreamingRecognizeRequest(audio_content=message["bytes"]))
-                
-                elif message["type"] == "websocket.receive" and "text" in message:
-                    if message["text"] == "END_OF_SPEECH":
-                        logger.info("Received END_OF_SPEECH signal from client.")
-                        break
-                    try:
-                        data = json.loads(message["text"])
-                        if data.get("type") == "sample_rate":
-                            stt_sample_rate_hertz = int(data["value"])
-                            logger.info(f"Received sample rate from frontend: {stt_sample_rate_hertz} Hz")
-                            stt_config_set.set()
-                    except json.JSONDecodeError:
-                        logger.debug(f"Received non-JSON text message: {message['text']}")
-        except WebSocketDisconnect:
-            logger.info("Client disconnected during audio consumption.")
-        except Exception as e:
-            logger.error(f"Error consuming audio stream: {e}")
-        finally:
-            sync_recognize_requests_queue.put_nowait(None)
-
-    def synchronous_request_generator():
-        while True:
-            request = sync_recognize_requests_queue.get()
-            if request is None:
-                break
-            yield request
-
-    async def transcribe_speech():
-        try:
-            await stt_config_set.wait()
-
-            config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=stt_sample_rate_hertz,
-                language_code="en-US",
-                enable_automatic_punctuation=True,
-            )
-            streaming_config = speech.StreamingRecognitionConfig(
-                config=config,
-                interim_results=False, 
-            )
-
-            def _run_stt_synchronously() -> List[str]:
-                logger.info("Starting synchronous STT recognition in a new thread.")
-                collected_transcripts = []
-                try:
-                    responses_sync_iterator = speech_client.streaming_recognize(
-                        streaming_config, synchronous_request_generator()
-                    )
-                    for response in responses_sync_iterator:
-                        for result in response.results:
-                            if result.alternatives:
-                                collected_transcripts.append(result.alternatives[0].transcript)
-                except Exception as e:
-                    logger.error(f"Error within synchronous STT thread: {e}")
-                finally:
-                    logger.info("Synchronous STT thread finished.")
-                    return collected_transcripts
-
-            final_transcripts = await asyncio.to_thread(_run_stt_synchronously)
-            logger.info(f"STT processing task completed. Final transcripts: {final_transcripts}")
-
-            for transcript_text in final_transcripts:
-                await stt_results_queue.put(transcript_text)
-            await stt_results_queue.put(None)
-
-        except Exception as e:
-            logger.error(f"Error during speech transcription task setup/execution: {e}")
-            await stt_results_queue.put(None)
-
-    async def process_stt_results_consumer():
-        try:
-            while True:
-                transcript_text = await stt_results_queue.get()
-                if transcript_text is None:
-                    logger.info("Received STT results sentinel, stopping processing.")
-                    break 
-                
-                if websocket.client_state == WebSocketState.CONNECTED:
-                    await process_final_transcript(transcript_text, websocket, dialogflow_session_path)
-                else:
-                    logger.warning("WebSocket disconnected while trying to process STT results.")
-                    break
-        except Exception as e:
-            logger.error(f"Error processing STT results: {e}")
-        finally:
-            logger.info("STT results processing task finished.")
-
-    consumer_task = asyncio.create_task(consume_audio_stream())
-    transcribe_task = asyncio.create_task(transcribe_speech())
-    processor_task = asyncio.create_task(process_stt_results_consumer())
+    async def transition_to_state(new_state: AppState):
+        nonlocal current_state
+        current_state = new_state
+        logger.info(f"Transitioning to state: {current_state.value}")
+        await websocket.send_json({"type": "state_update", "state": current_state.value})
 
     try:
-        await asyncio.gather(consumer_task, transcribe_task, processor_task)
+        await transition_to_state(AppState.INTRODUCTION)
+        intro_text = "Hello! I'm your HCV Trainer. Before we begin, what's your name?"
+        await websocket.send_json({"type": "ai_response", "text": intro_text})
+        await stream_tts_and_send_to_client(intro_text, websocket)
+
+        while websocket.client_state == WebSocketState.CONNECTED:
+            message = await websocket.receive()
+            if "bytes" in message:
+                if transcription_task and not transcription_task.done() and audio_input_queue:
+                    await audio_input_queue.put(message["bytes"])
+            elif "text" in message:
+                data = json.loads(message["text"])
+                command = data.get("type") == "control" and data.get("command")
+
+                if command == "start_speech":
+                    logger.info("Client signaled start of speech.")
+                    audio_input_queue = asyncio.Queue()
+                    stt_results_queue = asyncio.Queue()
+                    
+                    # --- FIX: Call the CORRECT, renamed transcribe_speech function ---
+                    transcription_task = asyncio.create_task(
+                        transcribe_speech(audio_input_queue, stt_results_queue)
+                    )
+                    
+                    async def result_handler():
+                        transcript = await stt_results_queue.get()
+                        # We process even empty transcripts to avoid getting stuck
+                        await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state)
+                    
+                    asyncio.create_task(result_handler())
+
+                elif command == "end_speech":
+                    logger.info("Client signaled end of speech.")
+                    if transcription_task and not transcription_task.done() and audio_input_queue:
+                        await audio_input_queue.put(None)
+                
+                elif command == "resume_lesson":
+                    logger.info("Received resume command from button.")
+                    if current_state == AppState.LESSON_PAUSED:
+                         await transition_to_state(AppState.LESSON_DELIVERY)
+                         resume_text = "Of course. Resuming the lesson."
+                         await websocket.send_json({"type": "ai_response", "text": resume_text})
+                         await stream_tts_and_send_to_client(resume_text, websocket)
+                
+                elif command == "pause_lesson":
+                    logger.info("Received pause command.")
+                    await transition_to_state(AppState.LESSON_PAUSED)
+
+    except WebSocketDisconnect:
+        logger.info("Client disconnected.")
     except Exception as e:
-        logger.error(f"An error occurred in websocket_endpoint: {e}")
+        logger.error(f"Error in websocket endpoint: {e}", exc_info=True)
     finally:
-        for task in [consumer_task, transcribe_task, processor_task]:
-            if not task.done():
-                task.cancel()
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        logger.info("WebSocket connection closed and tasks cleaned up.")
+        if transcription_task and not transcription_task.done():
+            transcription_task.cancel()
+        logger.info("WebSocket connection closed.")
+
+async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState):
+    """Orchestrates the AI's response and state transitions."""
+    if transcript:
+        await websocket.send_json({"type": "user_transcript", "text": transcript})
+
+    response_text = ""
+    if current_state == AppState.INTRODUCTION:
+        user_name = transcript.strip() if transcript.strip() else "there"
+        response_text = f"It's nice to meet you, {user_name}! Let's get started with our lesson."
+        await websocket.send_json({"type": "ai_response", "text": response_text})
+        await stream_tts_and_send_to_client(response_text, websocket)
+        
+        await transition_func(AppState.LESSON_DELIVERY)
+        # --- MODIFICATION: Pass the transition function to start_lesson ---
+        await start_lesson(websocket, transition_func)
+
+    elif current_state == AppState.QNA:
+        response_text = await get_rag_response(transcript, session_path)
+        await websocket.send_json({"type": "ai_response", "text": response_text})
+        await stream_tts_and_send_to_client(response_text, websocket)
+
+    elif current_state == AppState.LESSON_PAUSED:
+        if "resume" in transcript.lower() or "continue" in transcript.lower():
+            await transition_func(AppState.LESSON_DELIVERY)
+            response_text = "Of course. Resuming the lesson."
+            await websocket.send_json({"type": "ai_response", "text": response_text})
+            await stream_tts_and_send_to_client(response_text, websocket)
+            # Add logic here to continue the lesson from where it left off
+            
+async def start_lesson(websocket: WebSocket, transition_func):
+    """
+    Delivers a lesson segment and then transitions to the Q&A state.
+    """
+    lesson_text = "Today, we will be covering the fundamentals of the HCV Program. [INSERT LESSON CONTENT HERE]."
+
+    # 1. Deliver the lesson content
+    await websocket.send_json({"type": "ai_response", "text": lesson_text})
+    await stream_tts_and_send_to_client(lesson_text, websocket)
+    logger.info("Lesson segment has been delivered.")
+    
+    # --- NEW: Transition to Q&A state after the lesson ---
+    
+    # A small delay for better conversational pacing
+    await asyncio.sleep(1.0) 
+    
+    logger.info("Transitioning to Q&A state.")
+    await transition_func(AppState.QNA)
+    
+    # 2. Prompt the user for questions
+    qna_prompt = "Do you have any questions about what we just covered?"
+    await websocket.send_json({"type": "ai_response", "text": qna_prompt})
+    await stream_tts_and_send_to_client(qna_prompt, websocket)
+
+async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
+    logger.info(f"Getting RAG answer for: '{transcript_text}'")
+    if not transcript_text.strip(): return "I didn't catch that. Could you please repeat?"
+    if retrieval_chain:
+        try:
+            rag_result = await retrieval_chain.ainvoke({"input": transcript_text})
+            return rag_result.get("answer", "I couldn't find an answer in my documents.")
+        except Exception as e:
+            logger.error(f"Error during RAG invocation: {e}")
+            return "I had trouble looking that up."
+    return "The RAG system is not configured."
+
+
+# --- RE-INTRODUCED AND MODIFIED: Speech-to-Text (STT) Functions ---
+async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
+    """Transcribes a single utterance using the sync/async bridge pattern."""
+    sync_bridge_queue = queue.Queue()
+
+    def sync_stt_call():
+        def audio_generator():
+            while True:
+                chunk = sync_bridge_queue.get()
+                if chunk is None: break
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+        
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True
+        )
+        streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=False)
+
+        try:
+            responses = speech_client.streaming_recognize(config=streaming_config, requests=audio_generator())
+            transcript = ""
+            for r in responses:
+                if r.results and r.results[0].is_final:
+                    transcript = r.results[0].alternatives[0].transcript
+            
+            logger.info(f"STT Final Transcript: {transcript}")
+            stt_results_queue.put_nowait(transcript)
+        except Exception as e:
+            logger.error(f"Error in sync STT call: {e}")
+            stt_results_queue.put_nowait("")
+
+    stt_thread = asyncio.to_thread(sync_stt_call)
+    while True:
+        chunk = await audio_input_queue.get()
+        sync_bridge_queue.put(chunk)
+        if chunk is None: break
+    await stt_thread
+
 
 # --- MODIFICATION 3: Convert helper function to async ---
 async def get_dialogflow_response(transcript_text: str, session_path: str) -> str:
@@ -643,7 +657,7 @@ async def get_dialogflow_response(transcript_text: str, session_path: str) -> st
             session=session_path, query_input=query_input
         )
         # The fulfillment_text will now contain the final response from the webhook.
-        return response.query_result.fulfillment_text
+        return response.query_result
     except GoogleAPIError as e:
         logger.error(f"Dialogflow API error: {e}")
         return "I'm sorry, I'm having trouble connecting to my understanding service right now."
@@ -652,29 +666,56 @@ async def get_dialogflow_response(transcript_text: str, session_path: str) -> st
         return "I'm sorry, I'm having trouble with my understanding right now."
 
 async def stream_tts_and_send_to_client(text_to_synthesize: str, websocket: WebSocket):
-    """Synthesizes text to speech and sends it over the WebSocket."""
-    if tts_client is None:
-        logger.error("TTS client not initialized.")
-        return
-
+    # ... (This function is unchanged and works well) ...
+    if not text_to_synthesize: return
     synthesis_input = tts.SynthesisInput(text=text_to_synthesize)
     voice = tts.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-C")
     audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
-
     try:
-        # This is a blocking (synchronous) call, so we run it in a thread
-        # to avoid blocking the asyncio event loop.
         response = await asyncio.to_thread(
             tts_client.synthesize_speech,
             input=synthesis_input, voice=voice, audio_config=audio_config
         )
-        audio_bytes = response.audio_content
-
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_bytes(audio_bytes)
-            logger.info(f"Sent {len(audio_bytes)} bytes of TTS audio.")
-        else:
-            logger.warning("WebSocket disconnected, unable to send TTS audio.")
-
+            await websocket.send_bytes(response.audio_content)
+            logger.info(f"Sent {len(response.audio_content)} bytes of TTS audio.")
     except Exception as e:
-        logger.error(f"Error during TTS synthesis or sending audio: {e}")
+        logger.error(f"Error during TTS synthesis: {e}")
+# --- Correct `transcribe_speech` to be used by the new endpoint ---
+async def transcribe_speech_utterance(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
+    sync_bridge_queue = queue.Queue()
+
+    def sync_stt_call():
+        def audio_generator():
+            while True:
+                chunk = sync_bridge_queue.get()
+                if chunk is None: break
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+        
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True
+        )
+        streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=False)
+
+        try:
+            responses = speech_client.streaming_recognize(config=streaming_config, requests=audio_generator())
+            transcript = ""
+            for r in responses:
+                if r.results and r.results[0].is_final:
+                    transcript = r.results[0].alternatives[0].transcript
+            
+            logger.info(f"STT Final Transcript: {transcript}")
+            stt_results_queue.put_nowait(transcript)
+        except Exception as e:
+            logger.error(f"Error in sync STT call: {e}")
+            stt_results_queue.put_nowait("") # Ensure the handler doesn't wait forever
+
+    stt_thread = asyncio.to_thread(sync_stt_call)
+
+    while True:
+        chunk = await audio_input_queue.get()
+        sync_bridge_queue.put(chunk)
+        if chunk is None:
+            break
+    
+    await stt_thread
