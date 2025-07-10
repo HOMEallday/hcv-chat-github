@@ -329,22 +329,43 @@ html = """
     <title>HCV Trainer</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
-        #header-container {
-            padding: 15px 30px;
-            background-color: white;
-            border-bottom: 1px solid #ddd;
-            height: 50px; /* Give the container a fixed height */
+
+        /* --- FIX 1: Create a flex container for side-by-side layout --- */
+        #main-content {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 20px; /* Adds space between the character and chat box */
+            padding: 20px;
+            max-width: 1200px; /* Widen the max-width to fit both elements */
+            margin: auto;
         }
-        /* Style both the image and video */
-        #header-container img, #header-container video {
+
+        /* --- FIX 2: Increase the size of the character's container --- */
+        #character-container {
+            height: 250px; /* Increased from 50px, adjust as needed */
+        }
+        #character-container img, #character-container video {
             height: 100%;
             width: auto;
         }
-        #chat-container { max-width: 800px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; }
+
+        /* --- Chat box styling (mostly unchanged) --- */
+        #chat-container {
+            flex: 1; /* Allows the chat box to fill the remaining space */
+            max-width: 800px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            min-height: 400px;
+        }
+
+        /* --- Other styles (unchanged) --- */
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; }
         .user-message { background-color: #0084ff; color: white; text-align: left; margin-left: auto; }
         .ai-message { background-color: #e4e6eb; color: #050505; text-align: left; margin-right: auto; }
-        #controls, #status-bar { text-align: center; margin-top: 20px; }
+        #controls, #status-bar { text-align: center; margin-top: 20px; max-width: 800px; margin: 20px auto; }
         button { padding: 10px 20px; font-size: 1em; margin: 5px; cursor: pointer; border-radius: 20px; border: none; background-color: #0084ff; color: white; }
         button:disabled { background-color: #a0a0a0; cursor: not-allowed; }
         #status { font-weight: bold; color: #333; }
@@ -354,12 +375,14 @@ html = """
     </style>
 </head>
 <body>
-    <div id="header-container">
-        <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
-        <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video>
+    <div id="main-content">
+        <div id="character-container">
+            <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
+            <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video>
+        </div>
+        <div id="chat-container"><div id="conversation"></div></div>
     </div>
 
-    <div id="chat-container"><div id="conversation"></div></div>
     <div id="status-bar">Current State: <span id="status">Connecting...</span> Mic: <span id="mic-indicator"></span></div>
     <div id="controls">
         <button id="pauseButton" style="display: none;">Pause Lesson</button>
