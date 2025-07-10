@@ -150,14 +150,14 @@ async def lifespan(app: FastAPI):
                 logger.info(f"Chroma vector store loaded from {chroma_db_path}.")
 
                 # Create a retriever from the vector store
-                retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) # Retrieve top 3 similar documents
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 2}) # Retrieve top 3 similar documents
 
                 # Define the RAG prompt
                 rag_prompt = ChatPromptTemplate.from_messages([
                     ("system", """You are an AI assistant for housing policies. Use the following context to answer the user's question.
                      
-**Instructions:**
-- Provide a concise, conversational summary.
+**CRITICAL INSTRUCTIONS:**
+- Provide short responses. One or two sentences is ideal.
 - **You must not use any markdown formatting.** This includes never using asterisks (*) for lists.
 - Present lists naturally within a sentence. For example, instead of saying "* Item one * Item two", you should say "The policy includes item one, item two, and item three."
 - Prioritize your answer to be brief. Only provide a detailed, multi-point summary if the user explicitly asks for "details" or a "detailed summary".
