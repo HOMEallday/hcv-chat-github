@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import re
 import time
 
+from fastapi.staticfiles import StaticFiles 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -204,6 +205,8 @@ async def lifespan(app: FastAPI):
 # Pass the lifespan manager to FastAPI ---
 app = FastAPI(lifespan=lifespan)
 
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Allow CORS for your frontend
 origins = [
     "http://localhost:5173", # Default Vite dev server port
@@ -325,8 +328,19 @@ html = """
 <head>
     <title>HCV Trainer</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f0f2f5; }
-        #chat-container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; }
+        body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
+        #header-container {
+            padding: 15px 30px;
+            background-color: white;
+            border-bottom: 1px solid #ddd;
+            height: 50px; /* Give the container a fixed height */
+        }
+        /* Style both the image and video */
+        #header-container img, #header-container video {
+            height: 100%;
+            width: auto;
+        }
+        #chat-container { max-width: 800px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; }
         .user-message { background-color: #0084ff; color: white; text-align: left; margin-left: auto; }
         .ai-message { background-color: #e4e6eb; color: #050505; text-align: left; margin-right: auto; }
@@ -340,6 +354,11 @@ html = """
     </style>
 </head>
 <body>
+    <div id="header-container">
+        <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
+        <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video>
+    </div>
+
     <div id="chat-container"><div id="conversation"></div></div>
     <div id="status-bar">Current State: <span id="status">Connecting...</span> Mic: <span id="mic-indicator"></span></div>
     <div id="controls">
@@ -347,22 +366,25 @@ html = """
         <button id="resumeButton" style="display: none;">Resume Lesson</button>
         <button id="talkButton">Push to Talk</button>
     </div>
+
     <script>
+    // --- UI Elements ---
     const conversationDiv = document.getElementById('conversation');
     const statusSpan = document.getElementById('status');
     const micIndicator = document.getElementById('mic-indicator');
     const pauseButton = document.getElementById('pauseButton');
     const resumeButton = document.getElementById('resumeButton');
     const talkButton = document.getElementById('talkButton');
+    // --- Re-added character elements ---
+    const stillImage = document.getElementById('character-still');
+    const talkingVideo = document.getElementById('character-talking');
 
-    let ws;
-    let mediaStream;
-    let audioContext;
-    let processor;
-    let isListening = false;
+    // --- State Variables ---
+    let ws, mediaStream, processor, audioContext;
+    let isListening = false, isPlaying = false;
     let audioQueue = [];
-    let isPlaying = false;
-
+    
+    // --- WebSocket Connection ---
     function connect() {
         ws = new WebSocket(`ws://${window.location.host}/ws`);
         ws.onopen = () => console.log("WebSocket connected.");
@@ -383,14 +405,56 @@ html = """
         };
     }
 
-    function handleTextMessage(message) {
-        if (message.type === 'state_update') {
-            updateUIForState(message.state);
-        } else if (message.type === 'ai_response') {
-            addMessage(message.text, 'ai');
-        } else if (message.type === 'user_transcript') {
-            addMessage(message.text, 'user');
+    // --- Re-introducing animation logic ---
+    async function playNextAudio() {
+        if (audioQueue.length === 0) {
+            isPlaying = false;
+            talkingVideo.pause();
+            talkingVideo.style.display = 'none';
+            stillImage.style.display = 'block';
+            updateUIForState(statusSpan.textContent);
+            return;
         }
+
+        isPlaying = true;
+        updateUIForState(statusSpan.textContent);
+
+        stillImage.style.display = 'none';
+        talkingVideo.style.display = 'block';
+        
+        const audioBlob = audioQueue.shift();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        
+        audio.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            playNextAudio();
+        };
+
+        audio.onerror = (e) => {
+            console.error('Audio playback error:', e);
+            isPlaying = false;
+            talkingVideo.pause();
+            talkingVideo.style.display = 'none';
+            stillImage.style.display = 'block';
+            updateUIForState(statusSpan.textContent);
+        };
+        
+        try {
+            // This robust try/catch block prevents the app from getting stuck
+            await Promise.all([audio.play(), talkingVideo.play()]);
+        } catch (error) {
+            console.error("Error playing media, possibly due to autoplay restrictions:", error);
+            isPlaying = false;
+            updateUIForState(statusSpan.textContent); // This is key to re-enabling the button
+        }
+    }
+
+    // --- Other UI and Logic functions (unchanged) ---
+    function handleTextMessage(message) {
+        if (message.type === 'state_update') updateUIForState(message.state);
+        else if (message.type === 'ai_response') addMessage(message.text, 'ai');
+        else if (message.type === 'user_transcript') addMessage(message.text, 'user');
     }
 
     function updateUIForState(state) {
@@ -409,41 +473,9 @@ html = """
         conversationDiv.scrollTop = conversationDiv.scrollHeight;
     }
 
-    async function playNextAudio() {
-        if (audioQueue.length === 0) {
-            isPlaying = false;
-            updateUIForState(statusSpan.textContent);
-            return;
-        }
-        isPlaying = true;
-        updateUIForState(statusSpan.textContent);
-
-        const audioBlob = audioQueue.shift();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-
-        audio.onended = () => {
-            URL.revokeObjectURL(audioUrl);
-            playNextAudio();
-        };
-        audio.onerror = (e) => {
-            console.error('Audio playback error:', e);
-            isPlaying = false;
-            updateUIForState(statusSpan.textContent);
-        };
-        try {
-            await audio.play();
-        } catch (error) {
-            console.error("Error playing audio:", error);
-            isPlaying = false;
-            updateUIForState(statusSpan.textContent);
-        }
-    }
-
     async function startListening() {
         if (isListening || !ws || ws.readyState !== WebSocket.OPEN) return;
         
-        // --- FIX: Unlock browser audio on the first user interaction ---
         if (!audioContext || audioContext.state === 'suspended') {
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             await audioContext.resume();
@@ -479,17 +511,18 @@ html = """
         if (processor) processor.disconnect();
     }
 
+    // --- Event Listeners ---
     talkButton.onmousedown = startListening;
     talkButton.onmouseup = stopListening;
     pauseButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'pause_lesson' }));
     resumeButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'resume_lesson' }));
 
+    // --- Start Connection ---
     connect();
     </script>
 </body>
 </html>
 """
-
 
 @app.get("/")
 async def get():
