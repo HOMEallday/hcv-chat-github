@@ -10,6 +10,7 @@ from enum import Enum
 from typing import AsyncGenerator, List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 import re
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -25,6 +26,7 @@ from google.api_core.exceptions import GoogleAPIError
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
@@ -58,6 +60,38 @@ class AppState(Enum):
     LESSON_PAUSED = "LESSON_PAUSED"
     QNA = "QNA"
     QUIZ = "QUIZ"
+
+# In main.py, replace the UsageCallback class with this final version.
+
+class UsageCallback(BaseCallbackHandler):
+    """
+    A custom callback handler to capture token usage from Vertex AI.
+    This version uses the correct path to the metadata inside the 'generations' object.
+    """
+    def __init__(self):
+        super().__init__()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        """
+        This method is called when the LLM finishes its call.
+        """
+        # The token usage data is nested within the 'generations' object.
+        try:
+            # Check if the 'generations' list exists and is not empty
+            if response.generations and response.generations[0]:
+                
+                # Get the 'generation_info' from the first generation result
+                generation_info = response.generations[0][0].generation_info
+                
+                if generation_info:
+                    usage_metadata = generation_info.get("usage_metadata", {})
+                    self.prompt_tokens = usage_metadata.get("prompt_token_count", 0)
+                    self.completion_tokens = usage_metadata.get("candidates_token_count", 0)
+
+        except (KeyError, IndexError, AttributeError) as e:
+            logger.warning(f"Could not extract token usage from response: {e}")
 
 #Define lifespan context manager ---
 @asynccontextmanager
@@ -460,6 +494,7 @@ html = """
 @app.get("/")
 async def get():
     return HTMLResponse(html)
+# In main.py
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -468,11 +503,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
     current_state = AppState.IDLE
     session_id = f"{websocket.client.host}-{websocket.client.port}"
-    # This path is now created but only used if you call RAG/Dialogflow
-    dialogflow_session_path = "placeholder" # Simplified for now
+    dialogflow_session_path = dialogflow_sessions_client.session_path(
+        settings.GOOGLE_CLOUD_PROJECT_ID, session_id
+    )
 
-    transcription_task = None
-    audio_input_queue = None
+    # --- FIX: The audio queue is now the primary state 'switch' ---
+    audio_input_queue = None 
 
     async def transition_to_state(new_state: AppState):
         nonlocal current_state
@@ -482,48 +518,59 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         await transition_to_state(AppState.INTRODUCTION)
-        intro_text = "Hello! I'm your HCV Trainer. Before we begin, what's your name?"
+        intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
         await websocket.send_json({"type": "ai_response", "text": intro_text})
         await stream_tts_and_send_to_client(intro_text, websocket)
 
         while websocket.client_state == WebSocketState.CONNECTED:
             message = await websocket.receive()
+
+            # --- FIX: Simplified audio handling logic ---
             if "bytes" in message:
-                if transcription_task and not transcription_task.done() and audio_input_queue:
+                # If we have an active queue, put audio in it. No other checks needed.
+                if audio_input_queue:
                     await audio_input_queue.put(message["bytes"])
+            
             elif "text" in message:
                 data = json.loads(message["text"])
                 command = data.get("type") == "control" and data.get("command")
 
                 if command == "start_speech":
-                    logger.info("Client signaled start of speech.")
-                    audio_input_queue = asyncio.Queue()
-                    stt_results_queue = asyncio.Queue()
-                    
-                    # --- FIX: Call the CORRECT, renamed transcribe_speech function ---
-                    transcription_task = asyncio.create_task(
-                        transcribe_speech(audio_input_queue, stt_results_queue)
-                    )
-                    
-                    async def result_handler():
-                        transcript = await stt_results_queue.get()
-                        # We process even empty transcripts to avoid getting stuck
-                        await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state)
-                    
-                    asyncio.create_task(result_handler())
+                    # Only start a new session if one isn't already active.
+                    if audio_input_queue is None:
+                        logger.info("Client signaled start of speech. Creating new transcription task.")
+                        audio_input_queue = asyncio.Queue() # Create the queue immediately
+                        stt_results_queue = asyncio.Queue()
+                        
+                        transcription_task = asyncio.create_task(
+                            transcribe_speech(audio_input_queue, stt_results_queue)
+                        )
+                        
+                        async def result_handler():
+                            transcript = await stt_results_queue.get()
+                            await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state)
+                        
+                        asyncio.create_task(result_handler())
+                    else:
+                        logger.warning("Received 'start_speech' while already listening. Ignoring.")
+
 
                 elif command == "end_speech":
-                    logger.info("Client signaled end of speech.")
-                    if transcription_task and not transcription_task.done() and audio_input_queue:
-                        await audio_input_queue.put(None)
+                    # Only end the session if one is active.
+                    if audio_input_queue:
+                        logger.info("Client signaled end of speech.")
+                        await audio_input_queue.put(None) # Signal the end of the audio stream
+                        audio_input_queue = None # Set the 'switch' to off
+                    else:
+                        logger.warning("Received 'end_speech' but was not listening.")
                 
                 elif command == "resume_lesson":
                     logger.info("Received resume command from button.")
                     if current_state == AppState.LESSON_PAUSED:
-                         await transition_to_state(AppState.LESSON_DELIVERY)
-                         resume_text = "Of course. Resuming the lesson."
-                         await websocket.send_json({"type": "ai_response", "text": resume_text})
-                         await stream_tts_and_send_to_client(resume_text, websocket)
+                        await transition_to_state(AppState.LESSON_DELIVERY)
+                        resume_text = "Of course. Resuming the lesson."
+                        await websocket.send_json({"type": "ai_response", "text": resume_text})
+                        await stream_tts_and_send_to_client(resume_text, websocket)
                 
                 elif command == "pause_lesson":
                     logger.info("Received pause command.")
@@ -534,8 +581,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Error in websocket endpoint: {e}", exc_info=True)
     finally:
-        if transcription_task and not transcription_task.done():
-            transcription_task.cancel()
         logger.info("WebSocket connection closed.")
 
 async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState):
@@ -591,56 +636,123 @@ async def start_lesson(websocket: WebSocket, transition_func):
     await websocket.send_json({"type": "ai_response", "text": qna_prompt})
     await stream_tts_and_send_to_client(qna_prompt, websocket)
 
+
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
-    logger.info(f"Getting RAG answer for: '{transcript_text}'")
-    if not transcript_text.strip(): return "I didn't catch that. Could you please repeat?"
-    if retrieval_chain:
-        try:
-            rag_result = await retrieval_chain.ainvoke({"input": transcript_text})
-            return rag_result.get("answer", "I couldn't find an answer in my documents.")
-        except Exception as e:
-            logger.error(f"Error during RAG invocation: {e}")
-            return "I had trouble looking that up."
-    return "The RAG system is not configured."
+    """
+    Gets a response by first checking Dialogflow for specific intents, 
+    then falling back to the RAG chain for general questions.
+    Now includes performance and cost logging.
+    """
+    logger.info(f"Handling Q&A for: '{transcript_text}'")
+    total_start_time = time.perf_counter()
 
+    if not transcript_text.strip():
+        return "I didn't catch that. Could you please repeat?"
 
-# --- RE-INTRODUCED AND MODIFIED: Speech-to-Text (STT) Functions ---
+    # --- 1. Check Dialogflow First ---
+    df_start_time = time.perf_counter()
+    dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
+    df_latency = time.perf_counter() - df_start_time
+
+    if dialogflow_response and dialogflow_response.intent.display_name != "Default Fallback Intent":
+        logger.info(f"Dialogflow handled the query with intent: '{dialogflow_response.intent.display_name}'.")
+        response_text = dialogflow_response.fulfillment_text
+        
+        # Log Dialogflow performance (cost is per-request, not token-based)
+        total_latency = time.perf_counter() - total_start_time
+        logger.info(f"--- Dialogflow Performance ---")
+        logger.info(f"Dialogflow Latency: {df_latency:.4f} seconds")
+        logger.info(f"Total Latency: {total_latency:.4f} seconds")
+        logger.info(f"Dialogflow Cost: ~$0.007 per request")
+        logger.info(f"----------------------------")
+        
+        return response_text
+
+    # --- 2. Fallback to RAG ---
+    logger.info("Falling back to RAG system.")
+    usage_callback = UsageCallback()
+    rag_start_time = time.perf_counter()
+    rag_result = await retrieval_chain.ainvoke(
+        {"input": transcript_text},
+        config={"callbacks": [usage_callback]}
+    )
+    rag_latency = time.perf_counter() - rag_start_time
+    
+    response_text = rag_result.get("answer", "I couldn't find an answer in my documents.")
+    
+    # --- 3. Log Performance & Cost ---
+    log_and_calculate_cost(
+        prompt_tokens=usage_callback.prompt_tokens,
+        completion_tokens=usage_callback.completion_tokens
+    )
+    total_latency = time.perf_counter() - total_start_time
+    logger.info(f"--- Latency Breakdown ---")
+    logger.info(f"Dialogflow Check Latency: {df_latency:.4f} seconds")
+    logger.info(f"RAG Chain Latency: {rag_latency:.4f} seconds")
+    logger.info(f"Total Response Latency: {total_latency:.4f} seconds")
+    logger.info(f"-------------------------")
+
+    return response_text
+
+# In main.py, replace the entire transcribe_speech function with this one.
+
 async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
-    """Transcribes a single utterance using the sync/async bridge pattern."""
+    """
+    Transcribes a single utterance using the sync/async bridge pattern.
+    This version is more robust and processes the result immediately.
+    """
     sync_bridge_queue = queue.Queue()
 
     def sync_stt_call():
         def audio_generator():
             while True:
                 chunk = sync_bridge_queue.get()
-                if chunk is None: break
+                if chunk is None:
+                    break
                 yield speech.StreamingRecognizeRequest(audio_content=chunk)
-        
+
         config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
         )
-        streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=False)
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=False # We only want the final result
+        )
 
         try:
-            responses = speech_client.streaming_recognize(config=streaming_config, requests=audio_generator())
-            transcript = ""
-            for r in responses:
-                if r.results and r.results[0].is_final:
-                    transcript = r.results[0].alternatives[0].transcript
-            
-            logger.info(f"STT Final Transcript: {transcript}")
-            stt_results_queue.put_nowait(transcript)
-        except Exception as e:
-            logger.error(f"Error in sync STT call: {e}")
+            responses = speech_client.streaming_recognize(
+                config=streaming_config,
+                requests=audio_generator()
+            )
+
+            # --- FIX: Process the response stream and return on the first final result ---
+            for response in responses:
+                if response.results and response.results[0].is_final:
+                    transcript = response.results[0].alternatives[0].transcript
+                    logger.info(f"STT Final Transcript: {transcript}")
+                    stt_results_queue.put_nowait(transcript)
+                    return # Exit as soon as we have what we need
+
+            # If the loop finishes without ever finding a final result,
+            # send an empty string to unblock the handler.
+            logger.warning("STT stream ended without a final transcript.")
             stt_results_queue.put_nowait("")
 
+        except Exception as e:
+            logger.error(f"Error in sync STT call: {e}")
+            stt_results_queue.put_nowait("") # Ensure we don't block on error
+
+    # This part remains the same: it bridges the queues and runs the sync call in a thread.
     stt_thread = asyncio.to_thread(sync_stt_call)
     while True:
         chunk = await audio_input_queue.get()
         sync_bridge_queue.put(chunk)
-        if chunk is None: break
+        if chunk is None:
+            break
     await stt_thread
-
 
 # --- MODIFICATION 3: Convert helper function to async ---
 async def get_dialogflow_response(transcript_text: str, session_path: str) -> str:
@@ -745,3 +857,27 @@ def extract_name(transcript: str) -> str:
 
     # If all else fails, use a friendly default.
     return "there"
+
+def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_name: str = "gemini-2.5-flash"):
+        """
+        Logs token usage and calculates the estimated cost of a RAG query.
+        """
+        PRICING = {
+            "gemini-2.5-flash": {
+                "prompt": 0.0003,
+                "completion": 0.0025
+            },
+            # You could add other models here
+        }
+        cost = 0
+        if model_name in PRICING:
+            prompt_cost = (prompt_tokens / 1000) * PRICING[model_name]["prompt"]
+            completion_cost = (completion_tokens / 1000) * PRICING[model_name]["completion"]
+            cost = prompt_cost + completion_cost
+
+        logger.info("--- RAG Performance & Cost ---")
+        logger.info(f"Prompt Tokens: {prompt_tokens}")
+        logger.info(f"Completion Tokens: {completion_tokens}")
+        logger.info(f"Total Tokens: {prompt_tokens + completion_tokens}")
+        logger.info(f"Estimated Cost: ${cost:.6f}")
+        logger.info("------------------------------")
