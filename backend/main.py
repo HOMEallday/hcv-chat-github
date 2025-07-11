@@ -44,6 +44,7 @@ gemini_llm: Optional[ChatVertexAI] = None
 class AppState(Enum):
     IDLE = "IDLE"
     INTRODUCTION = "INTRODUCTION"
+    LESSON_PROLOGUE = "LESSON_PROLOGUE"
     LESSON_DELIVERY = "LESSON_DELIVERY"
     LESSON_PAUSED = "LESSON_PAUSED"
     QNA = "QNA"
@@ -196,21 +197,29 @@ html = """
     <title>HCV Trainer</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
+        #startup-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(240, 242, 245, 0.95); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
+        #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
+        .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; }
         #main-content { display: flex; justify-content: center; align-items: center; gap: 20px; padding: 20px; max-width: 1200px; margin: auto; }
         #character-container { height: 250px; width: 250px; }
         #character-container img, #character-container video { height: 100%; width: 100%; object-fit: cover; }
-        #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; }
-        .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; }
+        #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; overflow-y: auto; }
+        .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
         .user-message { background-color: #0084ff; color: white; margin-left: auto; }
         .ai-message { background-color: #e4e6eb; color: #050505; }
-        #controls, #status-bar { text-align: center; max-width: 800px; margin: 20px auto; }
-        button { padding: 10px 20px; font-size: 1em; margin: 5px; cursor: pointer; border-radius: 20px; border: none; background-color: #0084ff; color: white; }
-        button:disabled { background-color: #a0a0a0; }
+        #status-bar { text-align: center; max-width: 800px; margin: 20px auto; }
         #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 10px; }
         #mic-indicator.listening { background-color: #e74c3c; }
     </style>
 </head>
 <body>
+    <div id="startup-overlay">
+        <div id="lesson-menu">
+            <h2>HCV Training Program</h2>
+            <button id="lesson-1-btn" class="lesson-button">Lesson 1: Program Fundamentals</button>
+            <button class="lesson-button" disabled>Lesson 2: Coming Soon</button>
+        </div>
+    </div>
     <div id="main-content">
         <div id="character-container">
             <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
@@ -218,33 +227,96 @@ html = """
         </div>
         <div id="chat-container"><div id="conversation"></div></div>
     </div>
-    <div id="status-bar">Current State: <span id="status">Connecting...</span> Mic: <span id="mic-indicator"></span></div>
-    <div id="controls">
-        <button id="pauseButton" style="display: none;">Pause Lesson</button>
-        <button id="resumeButton" style="display: none;">Resume Lesson</button>
-        <button id="talkButton">Push to Talk</button>
-    </div>
+    <div id="status-bar">Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
+    
     <script>
-        // --- UI Elements ---
+        // UI Elements
         const conversationDiv = document.getElementById('conversation');
         const statusSpan = document.getElementById('status');
         const micIndicator = document.getElementById('mic-indicator');
-        const pauseButton = document.getElementById('pauseButton');
-        const resumeButton = document.getElementById('resumeButton');
-        const talkButton = document.getElementById('talkButton');
         const stillImage = document.getElementById('character-still');
         const talkingVideo = document.getElementById('character-talking');
 
-        // --- State Variables ---
-        let ws, mediaStream, processor, audioContext;
-        let isListening = false, isPlaying = false;
+        // VAD Code
+        const workletCode = `
+            class AudioProcessor extends AudioWorkletProcessor {
+                process(inputs) {
+                    const pcmData = inputs[0][0];
+                    if (pcmData) {
+                        this.port.postMessage(new Int16Array(pcmData.map(val => Math.max(-1, Math.min(1, val)) * 0x7FFF)));
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('audio-processor', AudioProcessor);
+        `;
+
+        // State variables
+        let ws, mediaStream, audioContext, workletNode, audioInput, vad;
+        let isPlaying = false;
         let audioQueue = [];
 
-        // --- WebSocket Connection ---
+        class VoiceActivityDetector {
+            constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 1.0) {
+                this.onSpeechStart = onSpeechStart;
+                this.onSpeechEnd = onSpeechEnd;
+                this.silenceThreshold = silenceThreshold;
+                this.analyser = null;
+                this.isSpeaking = false;
+                this.silenceStartTime = 0;
+                this.animationFrameId = null;
+            }
+            start(context, sourceNode) {
+                this.analyser = context.createAnalyser();
+                this.analyser.fftSize = 512;
+                sourceNode.connect(this.analyser);
+                this.isSpeaking = false;
+                this.monitor();
+            }
+            stop() {
+                if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
+                this.isSpeaking = false;
+            }
+            monitor = () => {
+                const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+                this.analyser.getByteFrequencyData(dataArray);
+                const averageVolume = dataArray.reduce((sum, val) => sum + val, 0) / dataArray.length;
+                if (averageVolume > 5) {
+                    this.silenceStartTime = 0;
+                    if (!this.isSpeaking) {
+                        this.isSpeaking = true;
+                        this.onSpeechStart();
+                    }
+                } else if (this.isSpeaking) {
+                    if (this.silenceStartTime === 0) this.silenceStartTime = Date.now();
+                    else if ((Date.now() - this.silenceStartTime) > this.silenceThreshold * 1000) {
+                        this.onSpeechEnd();
+                        this.isSpeaking = false; // Stop after firing once
+                    }
+                }
+                this.animationFrameId = requestAnimationFrame(this.monitor);
+            }
+        }
+
+        async function initializeApp() {
+            document.getElementById('startup-overlay').style.display = 'none';
+            if (!audioContext) {
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    const workletURL = URL.createObjectURL(blob);
+                    await audioContext.audioWorklet.addModule(workletURL);
+                    workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                } catch (e) { console.error("Error initializing audio context:", e); return; }
+            }
+            await audioContext.resume();
+            connect();
+        }
+
         function connect() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
             ws.onopen = () => console.log("WebSocket connected.");
-            ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (isListening) stopListening(); };
+            ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (vad) vad.stop(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
             ws.onmessage = (event) => {
                 if (typeof event.data === 'string') {
@@ -256,14 +328,17 @@ html = """
             };
         }
 
-        // --- Audio Playback & Animation (This part is correct) ---
         async function playNextAudio() {
+            if (vad) vad.stop();
             if (audioQueue.length === 0) {
                 isPlaying = false;
                 talkingVideo.pause();
                 talkingVideo.style.display = 'none';
                 stillImage.style.display = 'block';
                 updateUIForState(statusSpan.textContent);
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
+                }
                 return;
             }
             isPlaying = true;
@@ -274,79 +349,48 @@ html = """
             const audioBlob = audioQueue.shift();
             const audioUrl = URL.createObjectURL(audioBlob);
             const audio = new Audio(audioUrl);
-            
             audio.onended = () => { URL.revokeObjectURL(audioUrl); playNextAudio(); };
             audio.onerror = (e) => { isPlaying = false; updateUIForState(statusSpan.textContent); };
             
             try {
                 await Promise.all([audio.play(), talkingVideo.play()]);
             } catch (error) {
-                console.error("Error playing media:", error);
                 isPlaying = false;
                 updateUIForState(statusSpan.textContent);
             }
         }
 
-        // --- FIX: Reverting to createScriptProcessor for debugging ---
-        async function startListening() {
-            if (isListening || !ws || ws.readyState !== WebSocket.OPEN) return;
-            
+        async function startContinuousListening() {
+            if (isPlaying || !audioContext) return;
             try {
-                if (!audioContext || audioContext.state === 'suspended') {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                    await audioContext.resume();
-                }
-                
-                isListening = true;
-                micIndicator.classList.add('listening');
-                ws.send(JSON.stringify({ type: 'control', command: 'start_speech' }));
-
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000 } });
-                const audioInput = audioContext.createMediaStreamSource(mediaStream);
-                
-                // Using the older, simpler method
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
-                
-                processor.onaudioprocess = (event) => {
-                    if (!isListening) return;
-                    const inputData = event.inputBuffer.getChannelData(0);
-                    const int16Array = new Int16Array(inputData.length);
-                    for (let i = 0; i < inputData.length; i++) {
-                        int16Array[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-                    }
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(int16Array.buffer);
-                    }
+                await audioContext.resume();
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true } });
+                audioInput = audioContext.createMediaStreamSource(mediaStream);
+                audioInput.connect(workletNode);
+                workletNode.port.onmessage = (event) => {
+                    if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer);
                 };
-
-                audioInput.connect(processor);
-                processor.connect(audioContext.destination);
-
-            } catch (err) {
-                console.error("Mic start error:", err);
-                isListening = false;
-                micIndicator.classList.remove('listening');
-            }
+                vad = new VoiceActivityDetector(
+                    () => {
+                        micIndicator.classList.add('listening');
+                        ws.send(JSON.stringify({ type: 'control', command: 'start_speech' }));
+                    },
+                    () => {
+                        stopContinuousListening();
+                        ws.send(JSON.stringify({ type: 'control', command: 'end_speech' }));
+                    }
+                );
+                vad.start(audioContext, audioInput);
+            } catch (err) { console.error("Mic start error:", err); }
         }
 
-        function stopListening() {
-            if (!isListening) return;
-            isListening = false;
+        function stopContinuousListening() {
+            if (vad) vad.stop();
+            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+            if (audioInput) audioInput.disconnect();
             micIndicator.classList.remove('listening');
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'control', command: 'end_speech' }));
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(track => track.stop());
-            }
-            if (processor) {
-                processor.disconnect();
-                processor = null;
-            }
         }
-
-        // --- Other UI and Logic functions ---
+        
         function handleTextMessage(message) {
             if (message.type === 'state_update') updateUIForState(message.state);
             else if (message.type === 'ai_response') addMessage(message.text, 'ai');
@@ -355,28 +399,22 @@ html = """
 
         function updateUIForState(state) {
             statusSpan.textContent = state;
-            document.getElementById('pauseButton').style.display = (state === 'LESSON_DELIVERY') ? 'inline-block' : 'none';
-            document.getElementById('resumeButton').style.display = (state === 'LESSON_PAUSED') ? 'inline-block' : 'none';
-            const isConversational = ['INTRODUCTION', 'QNA', 'QUIZ', 'LESSON_PAUSED'].includes(state);
-            talkButton.disabled = isPlaying || !isConversational;
+            const isConversational = ['INTRODUCTION', 'QNA'].includes(state);
+            if (isConversational && !isPlaying) {
+                startContinuousListening();
+            } else {
+                stopContinuousListening();
+            }
         }
 
         function addMessage(text, sender) {
             const messageElem = document.createElement('div');
-            messageElem.classList.add('message', `${sender}-message`);
+            messageElem.classList.add('message', sender + '-message');
             messageElem.textContent = text;
             conversationDiv.appendChild(messageElem);
             conversationDiv.scrollTop = conversationDiv.scrollHeight;
         }
-
-        // --- Event Listeners ---
-        talkButton.onmousedown = startListening;
-        talkButton.onmouseup = stopListening;
-        pauseButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'pause_lesson' }));
-        resumeButton.onclick = () => ws.send(JSON.stringify({ type: 'control', command: 'resume_lesson' }));
-
-        // --- Start Connection ---
-        connect();
+        document.getElementById('lesson-1-btn').onclick = initializeApp;
     </script>
 </body>
 </html>
@@ -438,7 +476,29 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info("Client signaled end of speech.")
                         await audio_input_queue.put(None)
                         audio_input_queue = None
-
+                elif command == "tts_finished":
+                    logger.info(f"Client finished TTS in state: {current_state.value}")
+                    
+                    # After the bot asks for a name, it does nothing and waits for the user to speak.
+                    if current_state == AppState.INTRODUCTION:
+                        logger.info("Ready for user to introduce themselves.")
+                    
+                    # After the bot says "nice to meet you", it starts the lesson.
+                    elif current_state == AppState.LESSON_PROLOGUE:
+                        await transition_to_state(AppState.LESSON_DELIVERY)
+                        await start_lesson(websocket)
+                    
+                    # After the lesson audio, it moves to Q&A.
+                    elif current_state == AppState.LESSON_DELIVERY:
+                        await transition_to_state(AppState.QNA)
+                        qna_prompt = "Do you have any questions?"
+                        await websocket.send_json({"type": "ai_response", "text": qna_prompt})
+                        await stream_tts_and_send_to_client(qna_prompt, websocket)
+                    
+                    # After asking for questions, it just waits for the user.
+                    elif current_state == AppState.QNA:
+                        logger.info("Ready for user questions.")
+                
     except WebSocketDisconnect:
         logger.info("Client disconnected.")
     except Exception as e:
@@ -474,31 +534,37 @@ async def get_dialogflow_response(transcript_text: str, session_path: str):
         logger.error(f"Dialogflow API error: {e}")
         return f"Dialogflow Error: {e}"
 
+async def start_lesson(websocket: WebSocket):
+    """Delivers the lesson segment."""
+    lesson_text = "Today, we will cover the fundamentals of the HCV Program."
+    await websocket.send_json({"type": "ai_response", "text": lesson_text})
+    await stream_tts_and_send_to_client(lesson_text, websocket)
+    logger.info("Lesson segment has been delivered.")
+
 async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState):
     if transcript:
         await websocket.send_json({"type": "user_transcript", "text": transcript})
 
     if current_state == AppState.INTRODUCTION:
         user_name = extract_name(transcript)
-        response_text = f"It's nice to meet you, {user_name}! Let's get started with our lesson."
+        response_text = f"It's nice to meet you, {user_name}! Let's get started."
         await websocket.send_json({"type": "ai_response", "text": response_text})
         await stream_tts_and_send_to_client(response_text, websocket)
-        await transition_func(AppState.LESSON_DELIVERY)
-        await start_lesson(websocket, transition_func)
+        # Transition to an intermediate state to wait for the handshake
+        await transition_func(AppState.LESSON_PROLOGUE)
+
     elif current_state == AppState.QNA:
         response_text = await get_rag_response(transcript, session_path)
         await websocket.send_json({"type": "ai_response", "text": response_text})
         await stream_tts_and_send_to_client(response_text, websocket)
 
-async def start_lesson(websocket: WebSocket, transition_func):
+
+async def start_lesson(websocket: WebSocket):
     lesson_text = "Today, we will cover the fundamentals of the HCV Program."
     await websocket.send_json({"type": "ai_response", "text": lesson_text})
     await stream_tts_and_send_to_client(lesson_text, websocket)
-    await asyncio.sleep(1.0) 
-    await transition_func(AppState.QNA)
-    qna_prompt = "Do you have any questions about what we just covered?"
-    await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-    await stream_tts_and_send_to_client(qna_prompt, websocket)
+    logger.info("Lesson segment has been delivered.")
+
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
