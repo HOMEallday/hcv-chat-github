@@ -7,7 +7,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -131,6 +131,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class DialogflowWebhookRequest(BaseModel):
+    queryResult: Dict[str, Any]
+    session: Optional[str] = None
+
+def _perform_calculation(num1: float, num2: float, operation: str) -> str:
+    """Performs the specified mathematical operation."""
+    result = None
+    if operation == "add" or operation == "plus":
+        result = num1 + num2
+    elif operation == "subtract" or operation == "minus":
+        result = num1 - num2
+    elif operation == "multiply" or operation == "times":
+        result = num1 * num2
+    elif operation == "divide":
+        if num2 != 0:
+            result = num1 / num2
+        else:
+            return "I cannot divide by zero."
+    else:
+        return f"I don't recognize the operation '{operation}'."
+
+    if result is not None:
+        # Format to remove unnecessary .0 for whole numbers
+        if result == int(result):
+            return f"The answer is {int(result)}."
+        else:
+            return f"The answer is {result}."
+    return "I couldn't perform that calculation."
+
+@app.post("/webhook")
+async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
+    """
+    Handles incoming webhook requests from Dialogflow for calculations.
+    """
+    query_result = request_body.queryResult
+    intent_name = query_result.get("intent", {}).get("displayName")
+    parameters = query_result.get("parameters", {})
+    
+    fulfillment_text = "I'm sorry, I couldn't process your request."
+
+    if intent_name == "Calculate Math": # Make sure this matches your intent name in Dialogflow
+        try:
+            num1 = parameters.get("number1")
+            num2 = parameters.get("number2") # Dialogflow often names them number and number1
+            operation = parameters.get("operation")
+
+            if num1 is not None and num2 is not None and operation:
+                fulfillment_text = _perform_calculation(float(num1), float(num2), operation)
+            else:
+                fulfillment_text = "I need two numbers and an operation to do math."
+        except Exception as e:
+            logger.error(f"Error in webhook calculation: {e}")
+            fulfillment_text = "I ran into an error trying to calculate that."
+    
+    return JSONResponse(content={"fulfillmentText": fulfillment_text})
 
 # --- HTML Frontend ---
 html = """
