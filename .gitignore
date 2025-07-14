@@ -11,6 +11,8 @@
 # Data directory, can contain sensitive information
 /data 
 
+#key files
+hcv-botv1-b43e903c0b99.json
 
 # Build artifacts (React)
 /frontend/dist # If Vite builds to 'dist'
