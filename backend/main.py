@@ -6,7 +6,7 @@ import queue
 import re
 import time
 from contextlib import asynccontextmanager
-from enum import Enum
+from enum import Enum, auto
 from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -49,6 +49,8 @@ class AppState(Enum):
     LESSON_PAUSED = "LESSON_PAUSED"
     QNA = "QNA"
     QUIZ = "QUIZ"
+
+
 
 # --- LangChain Callback for Token Usage ---
 class UsageCallback(BaseCallbackHandler):
@@ -429,6 +431,11 @@ async def get():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established.")
+
+    # --- STATE MANAGEMENT ---
+    #current_state = ConversationState.START
+    #lesson_step = 0
+
     current_state = AppState.IDLE
     dialogflow_session_path = ""
     audio_input_queue = None 
@@ -534,13 +541,6 @@ async def get_dialogflow_response(transcript_text: str, session_path: str):
         logger.error(f"Dialogflow API error: {e}")
         return f"Dialogflow Error: {e}"
 
-async def start_lesson(websocket: WebSocket):
-    """Delivers the lesson segment."""
-    lesson_text = "Today, we will cover the fundamentals of the HCV Program."
-    await websocket.send_json({"type": "ai_response", "text": lesson_text})
-    await stream_tts_and_send_to_client(lesson_text, websocket)
-    logger.info("Lesson segment has been delivered.")
-
 async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState):
     if transcript:
         await websocket.send_json({"type": "user_transcript", "text": transcript})
@@ -560,7 +560,11 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
 
 
 async def start_lesson(websocket: WebSocket):
-    lesson_text = "Today, we will cover the fundamentals of the HCV Program."
+    lesson_text = """Today, we're going to dive into one of the most fundamental aspects of our work: determining a family's eligibility for the Housing Choice Voucher, or HCV, program.
+
+This session is based on the official 
+
+Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how we, as a Public Housing Authority, or PHA, apply them. It's absolutely critical that we strive for objectivity and consistency in every single case. We must always give families the chance to explain their circumstances and understand the basis for our decisions. And above all, every action we take must comply with all federal, state, and local fair housing and non-discrimination laws."""
     await websocket.send_json({"type": "ai_response", "text": lesson_text})
     await stream_tts_and_send_to_client(lesson_text, websocket)
     logger.info("Lesson segment has been delivered.")
@@ -629,3 +633,4 @@ async def stream_tts_and_send_to_client(text_to_synthesize: str, websocket: WebS
             await websocket.send_bytes(response.audio_content)
     except Exception as e:
         logger.error(f"Error during TTS synthesis: {e}")
+
