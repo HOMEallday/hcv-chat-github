@@ -46,10 +46,61 @@ class AppState(Enum):
     INTRODUCTION = "INTRODUCTION"
     LESSON_PROLOGUE = "LESSON_PROLOGUE"
     LESSON_DELIVERY = "LESSON_DELIVERY"
-    LESSON_PAUSED = "LESSON_PAUSED"
+    LESSON_QUESTION = "LESSON_QUESTION"
+    LESSON_FEEDBACK = "LESSON_FEEDBACK"
+    LESSON_QNA = "LESSON_QNA"
     QNA = "QNA"
-    QUIZ = "QUIZ"
+    QUIZ_START = "QUIZ_START"
+    QUIZ_QUESTION = "QUIZ_QUESTION"
+    QUIZ_FEEDBACK = "QUIZ_FEEDBACK"
+    QUIZ_COMPLETE = "QUIZ_COMPLETE"
 
+
+# --- Lesson & Quiz Content ---
+lesson_flow = [
+    {
+        "type": "lecture",
+        "text": "Today, we're going to dive into one of the most fundamental aspects of our work: determining a family's eligibility for the Housing Choice Voucher, or HCV, program."
+    },
+    {
+        "type": "lecture",
+        "text": "This session is based on the official Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how we, as a Public Housing Authority, or PHA, apply them."
+    },
+    {
+        "type": "question",
+        "text": "What does PHA stand for?",
+        "correct_answer": "Public Housing Authority",
+        "feedback_correct": "That's right! Nicely done.",
+        "feedback_incorrect": "Not quite. PHA stands for Public Housing Authority. It's a key term we'll be using a lot."
+    },
+    {
+        "type": "lecture",
+        "text": "It's absolutely critical that we strive for objectivity and consistency in every single case. We must always give families the chance to explain their circumstances and understand the basis for our decisions."
+    },
+    {
+        "type": "lecture",
+        "text": "And above all, every action we take must comply with all federal, state, and local fair housing and non-discrimination laws."
+    },
+    {
+        "type": "qna_prompt",
+        "text": "That's the end of this section. Do you have any questions before we continue?"
+    }
+]
+
+quiz_questions = [
+    {
+        "type": "multiple_choice",
+        "text": "First question: What is the primary goal of the Housing Choice Voucher program?",
+        "options": ["A. To provide luxury housing", "B. To give families access to decent, safe, and sanitary housing", "C. To build new apartment complexes"],
+        "correct_answer": "B"
+    },
+    {
+        "type": "multiple_choice",
+        "text": "Second question: What must a PHA comply with during eligibility determination?",
+        "options": ["A. Only federal housing laws", "B. The tenant's personal preferences", "C. All federal, state, and local fair housing and non-discrimination laws"],
+        "correct_answer": "C"
+    }
+]
 
 
 # --- LangChain Callback for Token Usage ---
@@ -76,26 +127,24 @@ async def lifespan(app: FastAPI):
     global speech_client, tts_client, dialogflow_sessions_client, retrieval_chain, gemini_llm
     logger.info("--- Application Startup Initiated ---")
     try:
-        # Steps 1-4: Initialize clients (These are all working correctly)
+        # Initialize clients
         speech_client = speech.SpeechClient()
         tts_client = tts.TextToSpeechClient()
         dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
         vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID, location="us-central1")
         gemini_llm = ChatVertexAI(
-            model_name="gemini-2.5-flash", 
+            model_name="gemini-2.5-flash",
             temperature=0.2,
         )
         embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
-        
-        # Step 5: Load ChromaDB (Working correctly)
+
+        # Load ChromaDB
         chroma_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'chroma_db')
         if os.path.exists(chroma_db_path):
             vectorstore = Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
-            
-            # --- Step 6: Build RAG chain ---
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 
-            # --- FIX: Restored the full prompt template with the required variables ---
+            # Build RAG chain
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
             rag_prompt = ChatPromptTemplate.from_template("""
 You are an AI assistant for housing policies. Provide EXTREMELY concise, one-paragraph summaries.
 CRITICAL INSTRUCTIONS:
@@ -110,7 +159,7 @@ CONTEXT:
 QUESTION:
 {input}
 """)
-            
+
             document_chain = create_stuff_documents_chain(gemini_llm, rag_prompt)
             retrieval_chain = create_retrieval_chain(retriever, document_chain)
             logger.info(">>> RAG chain built successfully.")
@@ -118,8 +167,7 @@ QUESTION:
             logger.error(f"Chroma DB not found at {chroma_db_path}. RAG will be unavailable.")
 
     except Exception as e:
-        logger.error(f"!!! STARTUP FAILED at one of the steps above !!!")
-        logger.error(f"Error details: {e}", exc_info=True)
+        logger.error(f"!!! STARTUP FAILED !!! Error details: {e}", exc_info=True)
 
     yield
     logger.info("--- Application Shutdown ---")
@@ -157,7 +205,6 @@ def _perform_calculation(num1: float, num2: float, operation: str) -> str:
         return f"I don't recognize the operation '{operation}'."
 
     if result is not None:
-        # Format to remove unnecessary .0 for whole numbers
         if result == int(result):
             return f"The answer is {int(result)}."
         else:
@@ -166,21 +213,15 @@ def _perform_calculation(num1: float, num2: float, operation: str) -> str:
 
 @app.post("/webhook")
 async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
-    """
-    Handles incoming webhook requests from Dialogflow for calculations.
-    """
     query_result = request_body.queryResult
     intent_name = query_result.get("intent", {}).get("displayName")
     parameters = query_result.get("parameters", {})
-    
     fulfillment_text = "I'm sorry, I couldn't process your request."
 
-    if intent_name == "Calculate Math": # Make sure this matches your intent name in Dialogflow
+    if intent_name == "Calculate Math":
         try:
-            num1 = parameters.get("number1")
-            num2 = parameters.get("number2") # Dialogflow often names them number and number1
+            num1, num2 = parameters.get("number1"), parameters.get("number2")
             operation = parameters.get("operation")
-
             if num1 is not None and num2 is not None and operation:
                 fulfillment_text = _perform_calculation(float(num1), float(num2), operation)
             else:
@@ -188,7 +229,7 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
         except Exception as e:
             logger.error(f"Error in webhook calculation: {e}")
             fulfillment_text = "I ran into an error trying to calculate that."
-    
+
     return JSONResponse(content={"fulfillmentText": fulfillment_text})
 
 # --- HTML Frontend ---
@@ -230,30 +271,25 @@ html = """
         <div id="chat-container"><div id="conversation"></div></div>
     </div>
     <div id="status-bar">Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
-    
+
     <script>
-        // UI Elements
         const conversationDiv = document.getElementById('conversation');
         const statusSpan = document.getElementById('status');
         const micIndicator = document.getElementById('mic-indicator');
         const stillImage = document.getElementById('character-still');
         const talkingVideo = document.getElementById('character-talking');
 
-        // VAD Code
         const workletCode = `
             class AudioProcessor extends AudioWorkletProcessor {
                 process(inputs) {
                     const pcmData = inputs[0][0];
-                    if (pcmData) {
-                        this.port.postMessage(new Int16Array(pcmData.map(val => Math.max(-1, Math.min(1, val)) * 0x7FFF)));
-                    }
+                    if (pcmData) this.port.postMessage(new Int16Array(pcmData.map(val => Math.max(-1, Math.min(1, val)) * 0x7FFF)));
                     return true;
                 }
             }
             registerProcessor('audio-processor', AudioProcessor);
         `;
 
-        // State variables
         let ws, mediaStream, audioContext, workletNode, audioInput, vad;
         let isPlaying = false;
         let audioQueue = [];
@@ -275,26 +311,17 @@ html = """
                 this.isSpeaking = false;
                 this.monitor();
             }
-            stop() {
-                if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
-                this.isSpeaking = false;
-            }
+            stop() { if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId); this.isSpeaking = false; }
             monitor = () => {
                 const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
                 this.analyser.getByteFrequencyData(dataArray);
                 const averageVolume = dataArray.reduce((sum, val) => sum + val, 0) / dataArray.length;
                 if (averageVolume > 5) {
                     this.silenceStartTime = 0;
-                    if (!this.isSpeaking) {
-                        this.isSpeaking = true;
-                        this.onSpeechStart();
-                    }
+                    if (!this.isSpeaking) { this.isSpeaking = true; this.onSpeechStart(); }
                 } else if (this.isSpeaking) {
                     if (this.silenceStartTime === 0) this.silenceStartTime = Date.now();
-                    else if ((Date.now() - this.silenceStartTime) > this.silenceThreshold * 1000) {
-                        this.onSpeechEnd();
-                        this.isSpeaking = false; // Stop after firing once
-                    }
+                    else if ((Date.now() - this.silenceStartTime) > this.silenceThreshold * 1000) { this.onSpeechEnd(); this.isSpeaking = false; }
                 }
                 this.animationFrameId = requestAnimationFrame(this.monitor);
             }
@@ -306,8 +333,7 @@ html = """
                 try {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                     const blob = new Blob([workletCode], { type: 'application/javascript' });
-                    const workletURL = URL.createObjectURL(blob);
-                    await audioContext.audioWorklet.addModule(workletURL);
+                    await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
                     workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
                 } catch (e) { console.error("Error initializing audio context:", e); return; }
             }
@@ -321,12 +347,8 @@ html = """
             ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (vad) vad.stop(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
             ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    handleTextMessage(JSON.parse(event.data));
-                } else if (event.data instanceof Blob) {
-                    audioQueue.push(event.data);
-                    if (!isPlaying) playNextAudio();
-                }
+                if (typeof event.data === 'string') handleTextMessage(JSON.parse(event.data));
+                else if (event.data instanceof Blob) { audioQueue.push(event.data); if (!isPlaying) playNextAudio(); }
             };
         }
 
@@ -338,28 +360,21 @@ html = """
                 talkingVideo.style.display = 'none';
                 stillImage.style.display = 'block';
                 updateUIForState(statusSpan.textContent);
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
-                }
+                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
                 return;
             }
             isPlaying = true;
             updateUIForState(statusSpan.textContent);
             stillImage.style.display = 'none';
             talkingVideo.style.display = 'block';
-            
+
             const audioBlob = audioQueue.shift();
             const audioUrl = URL.createObjectURL(audioBlob);
             const audio = new Audio(audioUrl);
             audio.onended = () => { URL.revokeObjectURL(audioUrl); playNextAudio(); };
-            audio.onerror = (e) => { isPlaying = false; updateUIForState(statusSpan.textContent); };
-            
-            try {
-                await Promise.all([audio.play(), talkingVideo.play()]);
-            } catch (error) {
-                isPlaying = false;
-                updateUIForState(statusSpan.textContent);
-            }
+            audio.onerror = () => isPlaying = false;
+            try { await Promise.all([audio.play(), talkingVideo.play()]); }
+            catch (error) { isPlaying = false; }
         }
 
         async function startContinuousListening() {
@@ -369,18 +384,10 @@ html = """
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true } });
                 audioInput = audioContext.createMediaStreamSource(mediaStream);
                 audioInput.connect(workletNode);
-                workletNode.port.onmessage = (event) => {
-                    if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer);
-                };
+                workletNode.port.onmessage = (event) => { if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer); };
                 vad = new VoiceActivityDetector(
-                    () => {
-                        micIndicator.classList.add('listening');
-                        ws.send(JSON.stringify({ type: 'control', command: 'start_speech' }));
-                    },
-                    () => {
-                        stopContinuousListening();
-                        ws.send(JSON.stringify({ type: 'control', command: 'end_speech' }));
-                    }
+                    () => { micIndicator.classList.add('listening'); ws.send(JSON.stringify({ type: 'control', command: 'start_speech' })); },
+                    () => { stopContinuousListening(); ws.send(JSON.stringify({ type: 'control', command: 'end_speech' })); }
                 );
                 vad.start(audioContext, audioInput);
             } catch (err) { console.error("Mic start error:", err); }
@@ -392,7 +399,7 @@ html = """
             if (audioInput) audioInput.disconnect();
             micIndicator.classList.remove('listening');
         }
-        
+
         function handleTextMessage(message) {
             if (message.type === 'state_update') updateUIForState(message.state);
             else if (message.type === 'ai_response') addMessage(message.text, 'ai');
@@ -401,18 +408,15 @@ html = """
 
         function updateUIForState(state) {
             statusSpan.textContent = state;
-            const isConversational = ['INTRODUCTION', 'QNA'].includes(state);
-            if (isConversational && !isPlaying) {
-                startContinuousListening();
-            } else {
-                stopContinuousListening();
-            }
+            const isConversational = ['INTRODUCTION', 'QNA', 'LESSON_QUESTION', 'LESSON_QNA', 'QUIZ_QUESTION'].includes(state);
+            if (isConversational && !isPlaying) startContinuousListening();
+            else stopContinuousListening();
         }
 
         function addMessage(text, sender) {
             const messageElem = document.createElement('div');
             messageElem.classList.add('message', sender + '-message');
-            messageElem.textContent = text;
+            messageElem.innerHTML = text.replace(/\\n/g, '<br>');
             conversationDiv.appendChild(messageElem);
             conversationDiv.scrollTop = conversationDiv.scrollHeight;
         }
@@ -422,7 +426,7 @@ html = """
 </html>
 """
 
-# --- Main WebSocket Endpoint ---
+# --- Main Endpoints ---
 @app.get("/")
 async def get():
     return HTMLResponse(html)
@@ -433,18 +437,57 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("WebSocket connection established.")
 
     # --- STATE MANAGEMENT ---
-    #current_state = ConversationState.START
-    #lesson_step = 0
-
     current_state = AppState.IDLE
     dialogflow_session_path = ""
-    audio_input_queue = None 
+    audio_input_queue = None
+    lesson_step = 0
+    quiz_step = 0
 
     async def transition_to_state(new_state: AppState):
         nonlocal current_state
         current_state = new_state
         logger.info(f"Transitioning to state: {current_state.value}")
         await websocket.send_json({"type": "state_update", "state": current_state.value})
+
+    async def advance_lesson():
+        nonlocal lesson_step
+        if lesson_step < len(lesson_flow):
+            step_data = lesson_flow[lesson_step]
+            lesson_step += 1
+
+            if step_data["type"] == "lecture":
+                await transition_to_state(AppState.LESSON_DELIVERY)
+                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
+                await stream_tts_and_send_to_client(step_data["text"], websocket)
+            elif step_data["type"] == "question":
+                await transition_to_state(AppState.LESSON_QUESTION)
+                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
+                await stream_tts_and_send_to_client(step_data["text"], websocket)
+            elif step_data["type"] == "qna_prompt":
+                await transition_to_state(AppState.LESSON_QNA)
+                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
+                await stream_tts_and_send_to_client(step_data["text"], websocket)
+        else:
+            await transition_to_state(AppState.QUIZ_START)
+            end_text = "You've completed the lesson! Now for a final quiz."
+            await websocket.send_json({"type": "ai_response", "text": end_text})
+            await stream_tts_and_send_to_client(end_text, websocket)
+
+    async def advance_quiz():
+        nonlocal quiz_step
+        if quiz_step < len(quiz_questions):
+            question_data = quiz_questions[quiz_step]
+            quiz_step += 1
+            await transition_to_state(AppState.QUIZ_QUESTION)
+            formatted_text = f"{question_data['text']}\\n" + "\\n".join(question_data['options'])
+            await websocket.send_json({"type": "ai_response", "text": formatted_text})
+            tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
+            await stream_tts_and_send_to_client(tts_text, websocket)
+        else:
+            await transition_to_state(AppState.QUIZ_COMPLETE)
+            end_text = "You've completed the quiz! Great job."
+            await websocket.send_json({"type": "ai_response", "text": end_text})
+            await stream_tts_and_send_to_client(end_text, websocket)
 
     try:
         await transition_to_state(AppState.INTRODUCTION)
@@ -465,17 +508,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info("Client signaled start of speech.")
                         audio_input_queue = asyncio.Queue()
                         stt_results_queue = asyncio.Queue()
-                        
+
                         session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
                         dialogflow_session_path = dialogflow_sessions_client.session_path(
                             settings.GOOGLE_CLOUD_PROJECT_ID, session_id
                         )
                         asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
-                        
+
                         async def result_handler():
                             transcript = await stt_results_queue.get()
-                            await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state)
-                        
+                            if transcript:
+                                await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, advance_quiz, quiz_step)
+                            else:
+                                logger.info("Received empty transcript. Re-prompting user.")
+                                reprompt_text = "I didn't catch that. Could you please say it again?"
+                                await websocket.send_json({"type": "ai_response", "text": reprompt_text})
+                                await stream_tts_and_send_to_client(reprompt_text, websocket)
+
                         asyncio.create_task(result_handler())
 
                 elif command == "end_speech":
@@ -485,27 +534,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_input_queue = None
                 elif command == "tts_finished":
                     logger.info(f"Client finished TTS in state: {current_state.value}")
-                    
-                    # After the bot asks for a name, it does nothing and waits for the user to speak.
-                    if current_state == AppState.INTRODUCTION:
-                        logger.info("Ready for user to introduce themselves.")
-                    
-                    # After the bot says "nice to meet you", it starts the lesson.
-                    elif current_state == AppState.LESSON_PROLOGUE:
-                        await transition_to_state(AppState.LESSON_DELIVERY)
-                        await start_lesson(websocket)
-                    
-                    # After the lesson audio, it moves to Q&A.
-                    elif current_state == AppState.LESSON_DELIVERY:
-                        await transition_to_state(AppState.QNA)
-                        qna_prompt = "Do you have any questions?"
-                        await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-                        await stream_tts_and_send_to_client(qna_prompt, websocket)
-                    
-                    # After asking for questions, it just waits for the user.
-                    elif current_state == AppState.QNA:
-                        logger.info("Ready for user questions.")
-                
+                    # Correctly advance only after non-interactive states
+                    if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
+                        await advance_lesson()
+                    elif current_state == AppState.QUIZ_START:
+                        await advance_quiz()
+                    elif current_state == AppState.QUIZ_FEEDBACK:
+                         await advance_quiz()
+
     except WebSocketDisconnect:
         logger.info("Client disconnected.")
     except Exception as e:
@@ -526,9 +562,7 @@ def extract_name(transcript: str) -> str:
 
 def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_name: str = "gemini-2.5-flash"):
     PRICING = {"gemini-2.5-flash": {"prompt": 0.00013, "completion": 0.00038}}
-    cost = 0
-    if model_name in PRICING:
-        cost = ((prompt_tokens / 1000) * PRICING[model_name]["prompt"]) + ((completion_tokens / 1000) * PRICING[model_name]["completion"])
+    cost = ((prompt_tokens / 1000) * PRICING[model_name]["prompt"]) + ((completion_tokens / 1000) * PRICING[model_name]["completion"]) if model_name in PRICING else 0
     logger.info(f"--- RAG Cost --- Tokens: {prompt_tokens}p + {completion_tokens}c = {prompt_tokens + completion_tokens}t | Est. Cost: ${cost:.6f}")
 
 async def get_dialogflow_response(transcript_text: str, session_path: str):
@@ -541,39 +575,54 @@ async def get_dialogflow_response(transcript_text: str, session_path: str):
         logger.error(f"Dialogflow API error: {e}")
         return f"Dialogflow Error: {e}"
 
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState):
-    if transcript:
-        await websocket.send_json({"type": "user_transcript", "text": transcript})
+async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, advance_quiz_func, quiz_step: int):
+    await websocket.send_json({"type": "user_transcript", "text": transcript})
 
     if current_state == AppState.INTRODUCTION:
         user_name = extract_name(transcript)
         response_text = f"It's nice to meet you, {user_name}! Let's get started."
         await websocket.send_json({"type": "ai_response", "text": response_text})
         await stream_tts_and_send_to_client(response_text, websocket)
-        # Transition to an intermediate state to wait for the handshake
         await transition_func(AppState.LESSON_PROLOGUE)
+
+    elif current_state == AppState.LESSON_QUESTION:
+        step_data = lesson_flow[lesson_step - 1]
+        feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
+        await transition_func(AppState.LESSON_FEEDBACK)
+        await websocket.send_json({"type": "ai_response", "text": feedback})
+        await stream_tts_and_send_to_client(feedback, websocket)
+
+    elif current_state == AppState.LESSON_QNA:
+        if "yes" in transcript.lower():
+            await transition_func(AppState.QNA)
+            qna_prompt = "Great, what's your question?"
+            await websocket.send_json({"type": "ai_response", "text": qna_prompt})
+            await stream_tts_and_send_to_client(qna_prompt, websocket)
+        else:
+            await advance_lesson_func()
 
     elif current_state == AppState.QNA:
         response_text = await get_rag_response(transcript, session_path)
         await websocket.send_json({"type": "ai_response", "text": response_text})
         await stream_tts_and_send_to_client(response_text, websocket)
+        qna_follow_up = "Do you have any other questions?"
+        await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
+        await stream_tts_and_send_to_client(qna_follow_up, websocket)
+        await transition_func(AppState.LESSON_QNA)
 
-
-async def start_lesson(websocket: WebSocket):
-    lesson_text = """Today, we're going to dive into one of the most fundamental aspects of our work: determining a family's eligibility for the Housing Choice Voucher, or HCV, program.
-
-This session is based on the official 
-
-Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how we, as a Public Housing Authority, or PHA, apply them. It's absolutely critical that we strive for objectivity and consistency in every single case. We must always give families the chance to explain their circumstances and understand the basis for our decisions. And above all, every action we take must comply with all federal, state, and local fair housing and non-discrimination laws."""
-    await websocket.send_json({"type": "ai_response", "text": lesson_text})
-    await stream_tts_and_send_to_client(lesson_text, websocket)
-    logger.info("Lesson segment has been delivered.")
-
+    elif current_state == AppState.QUIZ_QUESTION:
+        question_data = quiz_questions[quiz_step - 1]
+        user_answer = transcript.strip().upper()
+        correct_option_letter = question_data['correct_answer']
+        feedback = "Correct!" if correct_option_letter in user_answer else f"Not quite. The correct answer was {correct_option_letter}."
+        await transition_func(AppState.QUIZ_FEEDBACK)
+        await websocket.send_json({"type": "ai_response", "text": feedback})
+        await stream_tts_and_send_to_client(feedback, websocket)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
     if not transcript_text.strip(): return "I didn't catch that. Please repeat."
-    
+
     dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
     if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
         return dialogflow_response.fulfillment_text
@@ -581,10 +630,7 @@ async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -
     if not retrieval_chain: return "My document search system isn't configured."
     logger.info("Falling back to RAG system.")
     usage_callback = UsageCallback()
-    rag_result = await retrieval_chain.ainvoke(
-        {"input": transcript_text},
-        config={"callbacks": [usage_callback]}
-    )
+    rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
     log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
     return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
 
@@ -596,7 +642,7 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
                 chunk = sync_bridge_queue.get()
                 if chunk is None: break
                 yield speech.StreamingRecognizeRequest(audio_content=chunk)
-        
+
         config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True)
         streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=False)
         try:
@@ -605,8 +651,7 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
                 if response.results and response.results[0].is_final:
                     transcript = response.results[0].alternatives[0].transcript
                     logger.info(f"STT Final Transcript: {transcript}")
-                    stt_results_queue.put_nowait(transcript)
-                    return
+                    stt_results_queue.put_nowait(transcript); return
             logger.warning("STT stream ended without a final transcript.")
             stt_results_queue.put_nowait("")
         except Exception as e:
@@ -633,4 +678,3 @@ async def stream_tts_and_send_to_client(text_to_synthesize: str, websocket: WebS
             await websocket.send_bytes(response.audio_content)
     except Exception as e:
         logger.error(f"Error during TTS synthesis: {e}")
-
