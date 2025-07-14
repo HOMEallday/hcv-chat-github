@@ -242,14 +242,17 @@ html = """
         body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
         #startup-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(240, 242, 245, 0.95); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
         #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
-        .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; }
+        .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; cursor: pointer; border: 1px solid #ccc; background-color: #fff; }
         #main-content { display: flex; justify-content: center; align-items: center; gap: 20px; padding: 20px; max-width: 1200px; margin: auto; }
         #character-container { height: 250px; width: 250px; }
         #character-container img, #character-container video { height: 100%; width: 100%; object-fit: cover; }
-        #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; overflow-y: auto; }
+        #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; display: flex; flex-direction: column; }
+        #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
         .user-message { background-color: #0084ff; color: white; margin-left: auto; }
         .ai-message { background-color: #e4e6eb; color: #050505; }
+        #quiz-options { margin-top: 15px; display: flex; flex-direction: column; gap: 10px; }
+        .quiz-button { padding: 12px; font-size: 1em; text-align: left; }
         #status-bar { text-align: center; max-width: 800px; margin: 20px auto; }
         #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 10px; }
         #mic-indicator.listening { background-color: #e74c3c; }
@@ -268,12 +271,16 @@ html = """
             <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
             <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video>
         </div>
-        <div id="chat-container"><div id="conversation"></div></div>
+        <div id="chat-container">
+            <div id="conversation"></div>
+            <div id="quiz-options"></div>
+        </div>
     </div>
     <div id="status-bar">Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
 
     <script>
         const conversationDiv = document.getElementById('conversation');
+        const quizOptionsDiv = document.getElementById('quiz-options');
         const statusSpan = document.getElementById('status');
         const micIndicator = document.getElementById('mic-indicator');
         const stillImage = document.getElementById('character-still');
@@ -379,6 +386,10 @@ html = """
 
         async function startContinuousListening() {
             if (isPlaying || !audioContext) return;
+            const state = statusSpan.textContent;
+            const isConversational = ['INTRODUCTION', 'QNA', 'LESSON_QUESTION', 'LESSON_QNA'].includes(state);
+            if (!isConversational) return; // Don't listen during quiz questions
+
             try {
                 await audioContext.resume();
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true } });
@@ -399,18 +410,49 @@ html = """
             if (audioInput) audioInput.disconnect();
             micIndicator.classList.remove('listening');
         }
-
+        
         function handleTextMessage(message) {
-            if (message.type === 'state_update') updateUIForState(message.state);
-            else if (message.type === 'ai_response') addMessage(message.text, 'ai');
-            else if (message.type === 'user_transcript') addMessage(message.text, 'user');
+            clearQuizOptions();
+            if (message.type === 'state_update') {
+                updateUIForState(message.state);
+            } else if (message.type === 'ai_response') {
+                addMessage(message.text, 'ai');
+            } else if (message.type === 'user_transcript') {
+                addMessage(message.text, 'user');
+            } else if (message.type === 'quiz_question') {
+                addMessage(message.text, 'ai');
+                displayQuizOptions(message.options);
+            }
+        }
+        
+        function displayQuizOptions(options) {
+            options.forEach(optionText => {
+                const button = document.createElement('button');
+                button.className = 'lesson-button quiz-button';
+                button.innerHTML = optionText; // Use innerHTML to render formatted text
+                button.onclick = () => {
+                    const selectedOption = optionText.charAt(0); // e.g., "A"
+                    addMessage(optionText, 'user');
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'quiz_answer', answer: selectedOption }));
+                    }
+                    clearQuizOptions();
+                };
+                quizOptionsDiv.appendChild(button);
+            });
+        }
+        
+        function clearQuizOptions() {
+            quizOptionsDiv.innerHTML = '';
         }
 
         function updateUIForState(state) {
             statusSpan.textContent = state;
-            const isConversational = ['INTRODUCTION', 'QNA', 'LESSON_QUESTION', 'LESSON_QNA', 'QUIZ_QUESTION'].includes(state);
-            if (isConversational && !isPlaying) startContinuousListening();
-            else stopContinuousListening();
+            if (state === 'QUIZ_QUESTION') {
+                stopContinuousListening(); // Disable mic for quiz buttons
+            } else {
+                startContinuousListening(); // Re-enable for conversational states
+            }
         }
 
         function addMessage(text, sender) {
@@ -479,8 +521,12 @@ async def websocket_endpoint(websocket: WebSocket):
             question_data = quiz_questions[quiz_step]
             quiz_step += 1
             await transition_to_state(AppState.QUIZ_QUESTION)
-            formatted_text = f"{question_data['text']}\\n" + "\\n".join(question_data['options'])
-            await websocket.send_json({"type": "ai_response", "text": formatted_text})
+            # Send question text and options separately for button creation
+            await websocket.send_json({
+                "type": "quiz_question", 
+                "text": question_data['text'],
+                "options": question_data['options']
+            })
             tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
             await stream_tts_and_send_to_client(tts_text, websocket)
         else:
@@ -501,46 +547,60 @@ async def websocket_endpoint(websocket: WebSocket):
                 if audio_input_queue: await audio_input_queue.put(message["bytes"])
             elif "text" in message:
                 data = json.loads(message["text"])
-                command = data.get("type") == "control" and data.get("command")
+                msg_type = data.get("type")
 
-                if command == "start_speech":
-                    if audio_input_queue is None:
-                        logger.info("Client signaled start of speech.")
-                        audio_input_queue = asyncio.Queue()
-                        stt_results_queue = asyncio.Queue()
+                if msg_type == "control":
+                    command = data.get("command")
+                    if command == "start_speech":
+                        if audio_input_queue is None:
+                            logger.info("Client signaled start of speech.")
+                            audio_input_queue = asyncio.Queue()
+                            stt_results_queue = asyncio.Queue()
 
-                        session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
-                        dialogflow_session_path = dialogflow_sessions_client.session_path(
-                            settings.GOOGLE_CLOUD_PROJECT_ID, session_id
-                        )
-                        asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
+                            session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
+                            dialogflow_session_path = dialogflow_sessions_client.session_path(
+                                settings.GOOGLE_CLOUD_PROJECT_ID, session_id
+                            )
+                            asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
 
-                        async def result_handler():
-                            transcript = await stt_results_queue.get()
-                            if transcript:
-                                await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, advance_quiz, quiz_step)
-                            else:
-                                logger.info("Received empty transcript. Re-prompting user.")
-                                reprompt_text = "I didn't catch that. Could you please say it again?"
-                                await websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                                await stream_tts_and_send_to_client(reprompt_text, websocket)
+                            async def result_handler():
+                                transcript = await stt_results_queue.get()
+                                if transcript:
+                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step)
+                                else:
+                                    logger.info("Received empty transcript. Re-prompting user.")
+                                    reprompt_text = "I didn't catch that. Could you please say it again?"
+                                    await websocket.send_json({"type": "ai_response", "text": reprompt_text})
+                                    await stream_tts_and_send_to_client(reprompt_text, websocket)
 
-                        asyncio.create_task(result_handler())
+                            asyncio.create_task(result_handler())
 
-                elif command == "end_speech":
-                    if audio_input_queue:
-                        logger.info("Client signaled end of speech.")
-                        await audio_input_queue.put(None)
-                        audio_input_queue = None
-                elif command == "tts_finished":
-                    logger.info(f"Client finished TTS in state: {current_state.value}")
-                    # Correctly advance only after non-interactive states
-                    if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
-                        await advance_lesson()
-                    elif current_state == AppState.QUIZ_START:
-                        await advance_quiz()
-                    elif current_state == AppState.QUIZ_FEEDBACK:
-                         await advance_quiz()
+                    elif command == "end_speech":
+                        if audio_input_queue:
+                            logger.info("Client signaled end of speech.")
+                            await audio_input_queue.put(None)
+                            audio_input_queue = None
+                    elif command == "tts_finished":
+                        logger.info(f"Client finished TTS in state: {current_state.value}")
+                        if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
+                            await advance_lesson()
+                        elif current_state == AppState.QUIZ_START:
+                            await advance_quiz()
+                        elif current_state == AppState.QUIZ_FEEDBACK:
+                             await advance_quiz()
+                
+                elif msg_type == "quiz_answer":
+                    answer = data.get("answer")
+                    question_data = quiz_questions[quiz_step - 1]
+                    correct_option_letter = question_data['correct_answer']
+                    
+                    is_correct = (answer == correct_option_letter)
+                    feedback = "Correct!" if is_correct else f"Not quite. The correct answer was {correct_option_letter}."
+                    
+                    await transition_to_state(AppState.QUIZ_FEEDBACK)
+                    await websocket.send_json({"type": "ai_response", "text": feedback})
+                    await stream_tts_and_send_to_client(feedback, websocket)
+
 
     except WebSocketDisconnect:
         logger.info("Client disconnected.")
@@ -575,7 +635,7 @@ async def get_dialogflow_response(transcript_text: str, session_path: str):
         logger.error(f"Dialogflow API error: {e}")
         return f"Dialogflow Error: {e}"
 
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, advance_quiz_func, quiz_step: int):
+async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int):
     await websocket.send_json({"type": "user_transcript", "text": transcript})
 
     if current_state == AppState.INTRODUCTION:
@@ -609,15 +669,6 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
         await stream_tts_and_send_to_client(qna_follow_up, websocket)
         await transition_func(AppState.LESSON_QNA)
-
-    elif current_state == AppState.QUIZ_QUESTION:
-        question_data = quiz_questions[quiz_step - 1]
-        user_answer = transcript.strip().upper()
-        correct_option_letter = question_data['correct_answer']
-        feedback = "Correct!" if correct_option_letter in user_answer else f"Not quite. The correct answer was {correct_option_letter}."
-        await transition_func(AppState.QUIZ_FEEDBACK)
-        await websocket.send_json({"type": "ai_response", "text": feedback})
-        await stream_tts_and_send_to_client(feedback, websocket)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
