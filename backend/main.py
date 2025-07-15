@@ -64,7 +64,7 @@ lesson_flow = [
     },
     {
         "type": "lecture",
-        "text": "This session is based on the official Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how we, as a Public Housing Authority, or PHA, apply them."
+        "text": "This session is based on the official Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how as a Public Housing Authority, or PHA, we apply them."
     },
     {
         "type": "question",
@@ -392,7 +392,7 @@ html = """
 
             try {
                 await audioContext.resume();
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true } });
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true, noiseSuppression: true } });
                 audioInput = audioContext.createMediaStreamSource(mediaStream);
                 audioInput.connect(workletNode);
                 workletNode.port.onmessage = (event) => { if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer); };
@@ -653,13 +653,28 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         await stream_tts_and_send_to_client(feedback, websocket)
 
     elif current_state == AppState.LESSON_QNA:
-        if "yes" in transcript.lower():
-            await transition_func(AppState.QNA)
-            qna_prompt = "Great, what's your question?"
-            await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-            await stream_tts_and_send_to_client(qna_prompt, websocket)
-        else:
+        transcript_lower = transcript.lower().strip()
+        negative_responses = ["no", "nope", "nah", "i don't", "no thanks"]
+        is_negative = any(word in transcript_lower for word in negative_responses)
+
+        if is_negative:
             await advance_lesson_func()
+        else:
+            await transition_func(AppState.QNA)
+            if transcript_lower in ["yes", "yeah", "yep", "sure"]:
+                qna_prompt = "Great, what's your question?"
+                await websocket.send_json({"type": "ai_response", "text": qna_prompt})
+                await stream_tts_and_send_to_client(qna_prompt, websocket)
+            else:
+                # The user asked the question directly, so answer it immediately.
+                response_text = await get_rag_response(transcript, session_path)
+                await websocket.send_json({"type": "ai_response", "text": response_text})
+                await stream_tts_and_send_to_client(response_text, websocket)
+                # Ask if they have more questions and wait for a new response.
+                qna_follow_up = "Do you have any other questions?"
+                await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
+                await stream_tts_and_send_to_client(qna_follow_up, websocket)
+                await transition_func(AppState.LESSON_QNA)
 
     elif current_state == AppState.QNA:
         response_text = await get_rag_response(transcript, session_path)
