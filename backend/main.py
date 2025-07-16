@@ -257,7 +257,7 @@ html = """
 <head>
     <title>HCV Trainer</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; }
+        body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; display: flex; flex-direction: column; height: 100vh; }
         #startup-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(240, 242, 245, 0.95); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
         #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
         .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; cursor: pointer; border: 1px solid #ccc; background-color: #fff; }
@@ -271,9 +271,13 @@ html = """
         .ai-message { background-color: #e4e6eb; color: #050505; }
         #quiz-options { margin-top: 15px; display: flex; flex-direction: column; gap: 10px; }
         .quiz-button { padding: 12px; font-size: 1em; text-align: left; }
-        #status-bar { text-align: center; max-width: 800px; margin: 20px auto; }
-        #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 10px; }
+        #status-bar { text-align: center; max-width: 800px; margin: 20px auto; padding: 10px; background-color: #fff; border-radius: 8px; box-shadow: 0 1px 5px rgba(0,0,0,0.1); display: flex; justify-content: center; align-items: center; gap: 20px; }
+        #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 5px; }
         #mic-indicator.listening { background-color: #e74c3c; }
+        /* --- NEW STYLES for speed controls --- */
+        #speed-controls { display: flex; align-items: center; gap: 8px; }
+        .speed-button { padding: 5px 15px; font-size: 0.9em; cursor: pointer; border: 1px solid #ccc; background-color: #f0f0f0; border-radius: 15px; }
+        .speed-button.active { background-color: #0084ff; color: white; border-color: #0084ff; }
     </style>
 </head>
 <body>
@@ -294,9 +298,19 @@ html = """
             <div id="quiz-options"></div>
         </div>
     </div>
-    <div id="status-bar">Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
+    <div id="status-bar">
+        <div>Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
+        <!-- --- NEW HTML for speed controls --- -->
+        <div id="speed-controls">
+            <span>Speed:</span>
+            <button class="speed-button" data-rate="+0.00%">Slow</button>
+            <button class="speed-button active" data-rate="+13.00%">Normal</button>
+            <button class="speed-button" data-rate="+17.00%">Fast</button>
+        </div>
+    </div>
 
     <script>
+        // --- All the JS from before is here, with one new part ---
         const conversationDiv = document.getElementById('conversation');
         const quizOptionsDiv = document.getElementById('quiz-options');
         const statusSpan = document.getElementById('status');
@@ -306,8 +320,8 @@ html = """
 
         let ws, mediaStream, audioContext, workletNode, audioInput, vad;
         let isPlaying = false;
-        let currentAudioSource = null; // To keep track of the playing audio
-        let currentAudioChunks = []; // To buffer incoming audio chunks
+        let currentAudioSource = null;
+        let currentAudioChunks = [];
 
         const workletCode = `
             class AudioProcessor extends AudioWorkletProcessor {
@@ -319,9 +333,6 @@ html = """
             }
             registerProcessor('audio-processor', AudioProcessor);
         `;
-
-
-
         class VoiceActivityDetector {
             constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 1.0) {
                 this.onSpeechStart = onSpeechStart;
@@ -371,86 +382,94 @@ html = """
 
         function connect() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onopen = () => console.log("WebSocket connected.");
+            ws.onopen = () => {
+                console.log("WebSocket connected.");
+                // --- NEW: Set up speed control listeners after connection ---
+                setupSpeedControls();
+            };
             ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (vad) vad.stop(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
+            
             ws.onmessage = (event) => {
                 if (event.data instanceof Blob) {
-                    // Buffer all incoming audio chunks
                     currentAudioChunks.push(event.data);
                 } else if (typeof event.data === 'string') {
                     const message = JSON.parse(event.data);
-                    
                     if (message.type === 'tts_stream_finished') {
-                        // When the server confirms the stream is done, play the buffered audio
                         playCombinedAudio();
                     } else if (message.type === 'viseme') {
-                        // Viseme handling (for future animation) remains the same
-                        // console.log("Viseme:", message.viseme_id, "at", message.offset_ms, "ms");
+                        // console.log("Viseme:", message.viseme_id);
                     } else {
-                        // Handle all other text-based messages
                         handleTextMessage(message);
                     }
                 }
             };
         }
 
+        // --- NEW: Function to handle speed control logic ---
+        function setupSpeedControls() {
+            const speedButtons = document.querySelectorAll('.speed-button');
+            speedButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    // Remove 'active' class from all buttons
+                    speedButtons.forEach(btn => btn.classList.remove('active'));
+                    // Add 'active' class to the clicked button
+                    button.classList.add('active');
+                    
+                    const newRate = button.getAttribute('data-rate');
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        console.log(`Sending speed update to backend: ${newRate}`);
+                        ws.send(JSON.stringify({ type: 'set_speed', rate: newRate }));
+                    }
+                });
+            });
+        }
+
         async function playCombinedAudio() {
             if (currentAudioChunks.length === 0 || !audioContext) return;
-            
             isPlaying = true;
-            if (vad) vad.stop(); // Stop listening while AI speaks
+            if (vad) vad.stop();
             updateUIForState(statusSpan.textContent);
             stillImage.style.display = 'none';
             talkingVideo.style.display = 'block';
             talkingVideo.play();
 
-            // Combine all buffered chunks into a single Blob
             const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mp3' });
-            currentAudioChunks = []; // Clear the buffer for the next utterance
+            currentAudioChunks = [];
 
             try {
-                // Decode the Blob into a raw AudioBuffer for high-performance playback
                 const arrayBuffer = await audioBlob.arrayBuffer();
                 const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
-                // Stop any previously playing audio
-                if (currentAudioSource) {
-                    currentAudioSource.stop();
-                }
+                if (currentAudioSource) { currentAudioSource.stop(); }
 
-                // Create a new source node, set its buffer, and connect to speakers
                 currentAudioSource = audioContext.createBufferSource();
                 currentAudioSource.buffer = audioBuffer;
                 currentAudioSource.connect(audioContext.destination);
 
-                // Set an 'onended' event to handle cleanup and state transitions
                 currentAudioSource.onended = () => {
                     isPlaying = false;
                     talkingVideo.pause();
                     talkingVideo.style.display = 'none';
                     stillImage.style.display = 'block';
                     updateUIForState(statusSpan.textContent);
-                    // Inform the backend that TTS playback has finished
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
                     }
                 };
-
-                // Start playback now
                 currentAudioSource.start(0);
-
             } catch (e) {
                 console.error("Error decoding or playing audio:", e);
                 isPlaying = false;
             }
         }
-
+        
+        // --- All other JS functions are unchanged ---
         async function startContinuousListening() {
             if (isPlaying || !audioContext) return;
             const state = statusSpan.textContent;
             const isConversational = ['INTRODUCTION', 'QNA', 'LESSON_QUESTION', 'LESSON_QNA'].includes(state);
-            if (!isConversational) return; // Don't listen during quiz questions
+            if (!isConversational) return; 
 
             try {
                 await audioContext.resume();
@@ -465,14 +484,12 @@ html = """
                 vad.start(audioContext, audioInput);
             } catch (err) { console.error("Mic start error:", err); }
         }
-
         function stopContinuousListening() {
             if (vad) vad.stop();
             if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
             if (audioInput) audioInput.disconnect();
             micIndicator.classList.remove('listening');
         }
-        
         function handleTextMessage(message) {
             clearQuizOptions();
             if (message.type === 'state_update') {
@@ -486,14 +503,13 @@ html = """
                 displayQuizOptions(message.options);
             }
         }
-        
         function displayQuizOptions(options) {
             options.forEach(optionText => {
                 const button = document.createElement('button');
                 button.className = 'lesson-button quiz-button';
-                button.innerHTML = optionText; // Use innerHTML to render formatted text
+                button.innerHTML = optionText;
                 button.onclick = () => {
-                    const selectedOption = optionText.charAt(0); // e.g., "A"
+                    const selectedOption = optionText.charAt(0);
                     addMessage(optionText, 'user');
                     if (ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'quiz_answer', answer: selectedOption }));
@@ -503,20 +519,15 @@ html = """
                 quizOptionsDiv.appendChild(button);
             });
         }
-        
-        function clearQuizOptions() {
-            quizOptionsDiv.innerHTML = '';
-        }
-
+        function clearQuizOptions() { quizOptionsDiv.innerHTML = ''; }
         function updateUIForState(state) {
             statusSpan.textContent = state;
             if (state === 'QUIZ_QUESTION') {
-                stopContinuousListening(); // Disable mic for quiz buttons
+                stopContinuousListening();
             } else {
-                startContinuousListening(); // Re-enable for conversational states
+                startContinuousListening();
             }
         }
-
         function addMessage(text, sender) {
             const messageElem = document.createElement('div');
             messageElem.classList.add('message', sender + '-message');
@@ -524,6 +535,7 @@ html = """
             conversationDiv.appendChild(messageElem);
             conversationDiv.scrollTop = conversationDiv.scrollHeight;
         }
+
         document.getElementById('lesson-1-btn').onclick = initializeApp;
     </script>
 </body>
@@ -542,6 +554,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # --- STATE MANAGEMENT ---
     current_state = AppState.IDLE
+    speech_rate = "+13.00%" 
     dialogflow_session_path = ""
     audio_input_queue = None
     lesson_step = 0
@@ -558,24 +571,22 @@ async def websocket_endpoint(websocket: WebSocket):
         if lesson_step < len(lesson_flow):
             step_data = lesson_flow[lesson_step]
             lesson_step += 1
+            text = step_data["text"]
 
             if step_data["type"] == "lecture":
                 await transition_to_state(AppState.LESSON_DELIVERY)
-                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
             elif step_data["type"] == "question":
                 await transition_to_state(AppState.LESSON_QUESTION)
-                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
             elif step_data["type"] == "qna_prompt":
                 await transition_to_state(AppState.LESSON_QNA)
-                await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
+
+            await websocket.send_json({"type": "ai_response", "text": text})
+            await stream_azure_tts_and_send_to_client(text, websocket, speech_rate)
         else:
             await transition_to_state(AppState.QUIZ_START)
             end_text = "You've completed the lesson! Now for a final quiz."
             await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_azure_tts_and_send_to_client(end_text, websocket)
+            await stream_azure_tts_and_send_to_client(end_text, websocket, speech_rate)
 
     async def advance_quiz():
         nonlocal quiz_step
@@ -583,25 +594,23 @@ async def websocket_endpoint(websocket: WebSocket):
             question_data = quiz_questions[quiz_step]
             quiz_step += 1
             await transition_to_state(AppState.QUIZ_QUESTION)
-            # Send question text and options separately for button creation
             await websocket.send_json({
                 "type": "quiz_question", 
                 "text": question_data['text'],
                 "options": question_data['options']
             })
             tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
-            await stream_azure_tts_and_send_to_client(tts_text, websocket)
+            await stream_azure_tts_and_send_to_client(tts_text, websocket, speech_rate)
         else:
             await transition_to_state(AppState.QUIZ_COMPLETE)
             end_text = "You've completed the quiz! Great job."
             await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_azure_tts_and_send_to_client(end_text, websocket)
-
+            await stream_azure_tts_and_send_to_client(end_text, websocket, speech_rate)
     try:
         await transition_to_state(AppState.INTRODUCTION)
         intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
         await websocket.send_json({"type": "ai_response", "text": intro_text})
-        await stream_azure_tts_and_send_to_client(intro_text, websocket)
+        await stream_azure_tts_and_send_to_client(intro_text, websocket, speech_rate)
 
         while websocket.client_state == WebSocketState.CONNECTED:
             message = await websocket.receive()
@@ -611,14 +620,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
 
-                if msg_type == "control":
+                # --- NEW: Handle messages to update the speech rate ---
+                if msg_type == "set_speed":
+                    new_rate = data.get("rate")
+                    # Validate the input to prevent malicious SSML injection
+                    allowed_rates = ["+0.00%", "+13.00%", "+17.00%"]
+                    if new_rate in allowed_rates:
+                        speech_rate = new_rate
+                        logger.info(f"Client set speech rate to: {speech_rate}")
+                    else:
+                        logger.warning(f"Client sent invalid speech rate: {new_rate}")
+
+                elif msg_type == "control":
                     command = data.get("command")
                     if command == "start_speech":
                         if audio_input_queue is None:
-                            logger.info("Client signaled start of speech.")
                             audio_input_queue = asyncio.Queue()
                             stt_results_queue = asyncio.Queue()
-
                             session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
                             dialogflow_session_path = dialogflow_sessions_client.session_path(
                                 settings.GOOGLE_CLOUD_PROJECT_ID, session_id
@@ -628,41 +646,32 @@ async def websocket_endpoint(websocket: WebSocket):
                             async def result_handler():
                                 transcript = await stt_results_queue.get()
                                 if transcript:
-                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step)
+                                    # --- MODIFIED: Pass speech_rate to the handler ---
+                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, speech_rate)
                                 else:
-                                    logger.info("Received empty transcript. Re-prompting user.")
                                     reprompt_text = "I didn't catch that. Could you please say it again?"
                                     await websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                                    await stream_azure_tts_and_send_to_client(reprompt_text, websocket)
-
+                                    await stream_azure_tts_and_send_to_client(reprompt_text, websocket, speech_rate)
                             asyncio.create_task(result_handler())
 
                     elif command == "end_speech":
                         if audio_input_queue:
-                            logger.info("Client signaled end of speech.")
                             await audio_input_queue.put(None)
                             audio_input_queue = None
                     elif command == "tts_finished":
-                        logger.info(f"Client finished TTS in state: {current_state.value}")
                         if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
                             await advance_lesson()
-                        elif current_state == AppState.QUIZ_START:
+                        elif current_state == AppState.QUIZ_START or current_state == AppState.QUIZ_FEEDBACK:
                             await advance_quiz()
-                        elif current_state == AppState.QUIZ_FEEDBACK:
-                             await advance_quiz()
                 
                 elif msg_type == "quiz_answer":
                     answer = data.get("answer")
                     question_data = quiz_questions[quiz_step - 1]
-                    correct_option_letter = question_data['correct_answer']
-                    
-                    is_correct = (answer == correct_option_letter)
-                    feedback = "Correct!" if is_correct else f"Not quite. The correct answer was {correct_option_letter}."
-                    
+                    is_correct = (answer == question_data['correct_answer'])
+                    feedback = "Correct!" if is_correct else f"Not quite. The correct answer was {question_data['correct_answer']}."
                     await transition_to_state(AppState.QUIZ_FEEDBACK)
                     await websocket.send_json({"type": "ai_response", "text": feedback})
-                    await stream_azure_tts_and_send_to_client(feedback, websocket)
-
+                    await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
 
     except WebSocketDisconnect:
         logger.info("Client disconnected.")
@@ -697,14 +706,14 @@ async def get_dialogflow_response(transcript_text: str, session_path: str):
         logger.error(f"Dialogflow API error: {e}")
         return f"Dialogflow Error: {e}"
 
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int):
+async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, speech_rate: str):
     await websocket.send_json({"type": "user_transcript", "text": transcript})
 
     if current_state == AppState.INTRODUCTION:
         user_name = extract_name(transcript)
         response_text = f"It's nice to meet you, {user_name}! Let's get started."
         await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_azure_tts_and_send_to_client(response_text, websocket)
+        await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
         await transition_func(AppState.LESSON_PROLOGUE)
 
     elif current_state == AppState.LESSON_QUESTION:
@@ -712,40 +721,36 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
         await transition_func(AppState.LESSON_FEEDBACK)
         await websocket.send_json({"type": "ai_response", "text": feedback})
-        await stream_azure_tts_and_send_to_client(feedback, websocket)
+        await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
 
-    elif current_state == AppState.LESSON_QNA:
+
+
+    elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
+
+        if current_state != AppState.QNA:
+            await transition_func(AppState.QNA)
+            
         transcript_lower = transcript.lower().strip()
         negative_responses = ["no", "nope", "nah", "i don't", "no thanks"]
         is_negative = any(word in transcript_lower for word in negative_responses)
 
-        if is_negative:
+        if current_state == AppState.LESSON_QNA and is_negative:
             await advance_lesson_func()
         else:
             await transition_func(AppState.QNA)
-            if transcript_lower in ["yes", "yeah", "yep", "sure"]:
+            if transcript_lower in ["yes", "yeah", "yep", "sure", "i do"]:
                 qna_prompt = "Great, what's your question?"
                 await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-                await stream_azure_tts_and_send_to_client(qna_prompt, websocket) 
+                await stream_azure_tts_and_send_to_client(qna_prompt, websocket, speech_rate)
             else:
-                # The user asked the question directly, so answer it immediately.
                 response_text = await get_rag_response(transcript, session_path)
                 await websocket.send_json({"type": "ai_response", "text": response_text})
-                await stream_azure_tts_and_send_to_client(response_text, websocket)
-                # Ask if they have more questions and wait for a new response.
+                await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
+                
                 qna_follow_up = "Do you have any other questions?"
                 await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
-                await stream_azure_tts_and_send_to_client(qna_follow_up, websocket)
+                await stream_azure_tts_and_send_to_client(qna_follow_up, websocket, speech_rate)
                 await transition_func(AppState.LESSON_QNA)
-
-    elif current_state == AppState.QNA:
-        response_text = await get_rag_response(transcript, session_path)
-        await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_azure_tts_and_send_to_client(response_text, websocket) 
-        qna_follow_up = "Do you have any other questions?"
-        await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
-        await stream_azure_tts_and_send_to_client(qna_follow_up, websocket)
-        await transition_func(AppState.LESSON_QNA)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
@@ -811,33 +816,32 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
     synthesis_complete_future = loop.create_future()
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
 
-async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
+async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, rate: str):
+    """
+    Generates TTS audio using a DYNAMIC speech rate provided as an argument.
+    """
     if not speech_config or not text:
         logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
         return
 
-    
-    # We must escape XML characters like '&'
     escaped_text = text.replace("&", "&").replace("<", "<").replace(">", ">")
 
+    # --- MODIFIED: The 'rate' attribute now uses the function's 'rate' parameter ---
     ssml_text = f"""
     <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
         <voice name="{speech_config.speech_synthesis_voice_name}">
-            <mstts:express-as style="friendly">
-                <prosody rate="+13.00%" pitch="-5.00%">
-                    {escaped_text}
-                </prosody>
-            </mstts:express-as>
-            <mstts:silence type="Tailing" value="125ms"/>
+            <prosody rate="{rate}" pitch="-3%">
+                {escaped_text}
+                <mstts:silence type="Tailing" value="200ms"/>
+            </prosody>
         </voice>
     </speak>
     """
-    
+
     loop = asyncio.get_running_loop()
     synthesis_complete_future = loop.create_future()
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
 
-    # --- Async helper functions for safe sending (UNCHANGED) ---
     async def safe_send_bytes(data: bytes):
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
@@ -846,7 +850,7 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
             logger.warning("WebSocket disconnected during TTS audio streaming.")
             if not synthesis_complete_future.done():
                 synthesis_complete_future.set_result(False)
-    
+
     async def safe_send_json(data: dict):
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
@@ -856,7 +860,6 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
             if not synthesis_complete_future.done():
                 synthesis_complete_future.set_result(False)
 
-    # --- Synchronous Event Handlers (UNCHANGED) ---
     def audio_chunk_handler(evt: speechsdk.SpeechSynthesisEventArgs):
         asyncio.run_coroutine_threadsafe(safe_send_bytes(evt.result.audio_data), loop)
 
@@ -875,7 +878,6 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
         if not synthesis_complete_future.done():
             synthesis_complete_future.set_result(True)
 
-    # --- Connect Handlers and Start Synthesis (UNCHANGED) ---
     synthesizer.synthesizing.connect(audio_chunk_handler)
     synthesizer.viseme_received.connect(viseme_handler)
     synthesizer.synthesis_completed.connect(synthesis_complete_handler)
