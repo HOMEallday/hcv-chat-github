@@ -729,7 +729,7 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
 
         if current_state != AppState.QNA:
             await transition_func(AppState.QNA)
-            
+
         transcript_lower = transcript.lower().strip()
         negative_responses = ["no", "nope", "nah", "i don't", "no thanks"]
         is_negative = any(word in transcript_lower for word in negative_responses)
@@ -776,7 +776,7 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
                 if chunk is None: break
                 yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-        config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True)
+        config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=16000, language_code="en-US", enable_automatic_punctuation=True, use_enhanced=True)
         streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=False)
         try:
             responses = speech_client.streaming_recognize(config=streaming_config, requests=audio_generator())
