@@ -262,8 +262,34 @@ html = """
         #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
         .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; cursor: pointer; border: 1px solid #ccc; background-color: #fff; }
         #main-content { display: flex; justify-content: center; align-items: center; gap: 20px; padding: 20px; max-width: 1200px; margin: auto; }
-        #character-container { height: 250px; width: 250px; }
-        #character-container img, #character-container video { height: 100%; width: 100%; object-fit: cover; }
+        
+        /* --- MODIFIED: Character Container Styles --- */
+        #character-container {
+            height: 250px;
+            width: 250px;
+            position: relative; /* This is key for layering */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        #character-container img {
+            height: 100%;
+            width: 100%;
+            object-fit: cover;
+            position: absolute; /* Make images stack */
+            top: 0;
+            left: 0;
+        }
+        /* --- NEW: Style for the Viseme Mouth --- */
+        #viseme-mouth {
+            /* Adjust size and position to fit your character image */
+            width: 50%; 
+            height: auto;
+            position: absolute;
+            top: 55%; /* Example: positions the top of the mouth 55% down */
+            z-index: 10; /* Ensure it's on top of the base image */
+        }
+
         #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; display: flex; flex-direction: column; }
         #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
@@ -274,7 +300,6 @@ html = """
         #status-bar { text-align: center; max-width: 800px; margin: 20px auto; padding: 10px; background-color: #fff; border-radius: 8px; box-shadow: 0 1px 5px rgba(0,0,0,0.1); display: flex; justify-content: center; align-items: center; gap: 20px; }
         #mic-indicator { width: 20px; height: 20px; background-color: grey; border-radius: 50%; display: inline-block; vertical-align: middle; margin-left: 5px; }
         #mic-indicator.listening { background-color: #e74c3c; }
-        /* --- NEW STYLES for speed controls --- */
         #speed-controls { display: flex; align-items: center; gap: 8px; }
         .speed-button { padding: 5px 15px; font-size: 0.9em; cursor: pointer; border: 1px solid #ccc; background-color: #f0f0f0; border-radius: 15px; }
         .speed-button.active { background-color: #0084ff; color: white; border-color: #0084ff; }
@@ -285,13 +310,16 @@ html = """
         <div id="lesson-menu">
             <h2>HCV Training Program</h2>
             <button id="lesson-1-btn" class="lesson-button">Lesson 1: Program Fundamentals</button>
-            <button class="lesson-button" disabled>Lesson 2: Coming Soon</button>
         </div>
     </div>
     <div id="main-content">
+        <!-- --- MODIFIED: Character Container Content --- -->
         <div id="character-container">
-            <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character" style="display: block;">
-            <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video>
+            <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character Base">
+            <!-- This is the mouth that we will animate -->
+            <img id="viseme-mouth" src="/static/visemes/viseme_0.png" alt="AI Character Mouth">
+            <!-- The talking video is no longer needed for this animation method -->
+            <!-- <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video> -->
         </div>
         <div id="chat-container">
             <div id="conversation"></div>
@@ -300,28 +328,43 @@ html = """
     </div>
     <div id="status-bar">
         <div>Current State: <span id="status">Waiting to Start...</span> Mic: <span id="mic-indicator"></span></div>
-        <!-- --- NEW HTML for speed controls --- -->
         <div id="speed-controls">
             <span>Speed:</span>
             <button class="speed-button" data-rate="+0.00%">Slow</button>
-            <button class="speed-button active" data-rate="+13.00%">Normal</button>
-            <button class="speed-button" data-rate="+17.00%">Fast</button>
+            <button class="speed-button active" data-rate="+11.50%">Normal</button>
+            <button class="speed-button" data-rate="+50.00%">Fast</button>
         </div>
     </div>
 
     <script>
-        // --- All the JS from before is here, with one new part ---
+        // --- DOM Elements ---
         const conversationDiv = document.getElementById('conversation');
         const quizOptionsDiv = document.getElementById('quiz-options');
         const statusSpan = document.getElementById('status');
         const micIndicator = document.getElementById('mic-indicator');
-        const stillImage = document.getElementById('character-still');
-        const talkingVideo = document.getElementById('character-talking');
+        const characterStill = document.getElementById('character-still');
+        const visemeMouth = document.getElementById('viseme-mouth');
 
-        let ws, mediaStream, audioContext, workletNode, audioInput, vad;
+        // --- Global State Variables ---
+        let ws, audioContext, workletNode, vad, mediaStream, audioInput;
         let isPlaying = false;
         let currentAudioSource = null;
         let currentAudioChunks = [];
+        let visemeQueue = [];
+        let animationFrameId = null;
+
+        // --- Viseme Image Map ---
+        const visemeMap = {
+            0: '/static/visemes/viseme_0.png', 1: '/static/visemes/viseme_1.png', 2: '/static/visemes/viseme_2.png',
+            3: '/static/visemes/viseme_3.png', 4: '/static/visemes/viseme_4.png', 5: '/static/visemes/viseme_5.png',
+            6: '/static/visemes/viseme_6.png', 7: '/static/visemes/viseme_7.png', 8: '/static/visemes/viseme_8.png',
+            9: '/static/visemes/viseme_9.png', 10: '/static/visemes/viseme_10.png', 11: '/static/visemes/viseme_11.png',
+            12: '/static/visemes/viseme_12.png', 13: '/static/visemes/viseme_13.png', 14: '/static/visemes/viseme_14.png',
+            15: '/static/visemes/viseme_15.png', 16: '/static/visemes/viseme_16.png', 17: '/static/visemes/viseme_17.png',
+            18: '/static/visemes/viseme_18.png', 19: '/static/visemes/viseme_19.png', 20: '/static/visemes/viseme_20.png',
+            21: '/static/visemes/viseme_21.png'
+        };
+        Object.values(visemeMap).forEach(path => { (new Image()).src = path; });
 
         const workletCode = `
             class AudioProcessor extends AudioWorkletProcessor {
@@ -335,20 +378,12 @@ html = """
         `;
         class VoiceActivityDetector {
             constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 1.0) {
-                this.onSpeechStart = onSpeechStart;
-                this.onSpeechEnd = onSpeechEnd;
-                this.silenceThreshold = silenceThreshold;
-                this.analyser = null;
-                this.isSpeaking = false;
-                this.silenceStartTime = 0;
-                this.animationFrameId = null;
+                this.onSpeechStart = onSpeechStart; this.onSpeechEnd = onSpeechEnd; this.silenceThreshold = silenceThreshold;
+                this.analyser = null; this.isSpeaking = false; this.silenceStartTime = 0; this.animationFrameId = null;
             }
             start(context, sourceNode) {
-                this.analyser = context.createAnalyser();
-                this.analyser.fftSize = 512;
-                sourceNode.connect(this.analyser);
-                this.isSpeaking = false;
-                this.monitor();
+                this.analyser = context.createAnalyser(); this.analyser.fftSize = 512; sourceNode.connect(this.analyser);
+                this.isSpeaking = false; this.monitor();
             }
             stop() { if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId); this.isSpeaking = false; }
             monitor = () => {
@@ -382,12 +417,8 @@ html = """
 
         function connect() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onopen = () => {
-                console.log("WebSocket connected.");
-                // --- NEW: Set up speed control listeners after connection ---
-                setupSpeedControls();
-            };
-            ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (vad) vad.stop(); };
+            ws.onopen = () => { console.log("WebSocket connected."); setupSpeedControls(); };
+            ws.onclose = () => { statusSpan.textContent = "Disconnected"; stopContinuousListening(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
             
             ws.onmessage = (event) => {
@@ -398,7 +429,7 @@ html = """
                     if (message.type === 'tts_stream_finished') {
                         playCombinedAudio();
                     } else if (message.type === 'viseme') {
-                        // console.log("Viseme:", message.viseme_id);
+                        visemeQueue.push(message);
                     } else {
                         handleTextMessage(message);
                     }
@@ -406,34 +437,29 @@ html = """
             };
         }
 
-        // --- NEW: Function to handle speed control logic ---
-        function setupSpeedControls() {
-            const speedButtons = document.querySelectorAll('.speed-button');
-            speedButtons.forEach(button => {
-                button.addEventListener('click', () => {
-                    // Remove 'active' class from all buttons
-                    speedButtons.forEach(btn => btn.classList.remove('active'));
-                    // Add 'active' class to the clicked button
-                    button.classList.add('active');
-                    
-                    const newRate = button.getAttribute('data-rate');
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        console.log(`Sending speed update to backend: ${newRate}`);
-                        ws.send(JSON.stringify({ type: 'set_speed', rate: newRate }));
-                    }
-                });
-            });
+        function animateVisemes(audioStartTime) {
+            const elapsedTime = (audioContext.currentTime - audioStartTime) * 1000;
+            let latestViseme = null;
+            while (visemeQueue.length > 0 && visemeQueue[0].offset_ms <= elapsedTime) {
+                latestViseme = visemeQueue.shift();
+            }
+            if (latestViseme) {
+                visemeMouth.src = visemeMap[latestViseme.viseme_id];
+            }
+            if (isPlaying) {
+                animationFrameId = requestAnimationFrame(() => animateVisemes(audioStartTime));
+            }
         }
 
         async function playCombinedAudio() {
             if (currentAudioChunks.length === 0 || !audioContext) return;
+            
             isPlaying = true;
-            if (vad) vad.stop();
-            updateUIForState(statusSpan.textContent);
-            stillImage.style.display = 'none';
-            talkingVideo.style.display = 'block';
-            talkingVideo.play();
-
+            stopContinuousListening(); // Mic off while AI speaks
+            
+            characterStill.style.opacity = 1;
+            visemeMouth.style.display = 'block';
+            
             const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mp3' });
             currentAudioChunks = [];
 
@@ -442,6 +468,7 @@ html = """
                 const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
                 if (currentAudioSource) { currentAudioSource.stop(); }
+                if (animationFrameId) cancelAnimationFrame(animationFrameId);
 
                 currentAudioSource = audioContext.createBufferSource();
                 currentAudioSource.buffer = audioBuffer;
@@ -449,27 +476,45 @@ html = """
 
                 currentAudioSource.onended = () => {
                     isPlaying = false;
-                    talkingVideo.pause();
-                    talkingVideo.style.display = 'none';
-                    stillImage.style.display = 'block';
-                    updateUIForState(statusSpan.textContent);
+                    visemeMouth.src = visemeMap[0];
+                    visemeQueue = [];
+                    cancelAnimationFrame(animationFrameId);
+                    
+                    // --- THE FIX IS RESTORING THIS CALL ---
+                    // After the AI finishes speaking, we immediately check if we should start listening.
+                    startContinuousListening(); 
+                    
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
                     }
                 };
+                
+                const audioStartTime = audioContext.currentTime;
                 currentAudioSource.start(0);
+                animateVisemes(audioStartTime);
             } catch (e) {
                 console.error("Error decoding or playing audio:", e);
                 isPlaying = false;
             }
         }
         
-        // --- All other JS functions are unchanged ---
+        function stopContinuousListening() {
+            if (vad) { vad.stop(); vad = null; }
+            if (audioInput) { audioInput.disconnect(); audioInput = null; }
+            if (mediaStream) { mediaStream.getTracks().forEach(track => track.stop()); mediaStream = null; }
+            micIndicator.classList.remove('listening');
+        }
+
         async function startContinuousListening() {
+            stopContinuousListening();
             if (isPlaying || !audioContext) return;
+
             const state = statusSpan.textContent;
-            const isConversational = ['INTRODUCTION', 'QNA', 'LESSON_QUESTION', 'LESSON_QNA'].includes(state);
-            if (!isConversational) return; 
+            const isConversational = [
+                'INTRODUCTION', 'LESSON_QUESTION', 'LESSON_QNA', 'QNA', 'QUIZ_COMPLETE'
+            ].includes(state);
+
+            if (!isConversational) return;
 
             try {
                 await audioContext.resume();
@@ -477,19 +522,26 @@ html = """
                 audioInput = audioContext.createMediaStreamSource(mediaStream);
                 audioInput.connect(workletNode);
                 workletNode.port.onmessage = (event) => { if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer); };
+                
                 vad = new VoiceActivityDetector(
                     () => { micIndicator.classList.add('listening'); ws.send(JSON.stringify({ type: 'control', command: 'start_speech' })); },
-                    () => { stopContinuousListening(); ws.send(JSON.stringify({ type: 'control', command: 'end_speech' })); }
+                    () => { 
+                        stopContinuousListening();
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                           ws.send(JSON.stringify({ type: 'control', command: 'end_speech' })); 
+                        }
+                    }
                 );
                 vad.start(audioContext, audioInput);
             } catch (err) { console.error("Mic start error:", err); }
         }
-        function stopContinuousListening() {
-            if (vad) vad.stop();
-            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-            if (audioInput) audioInput.disconnect();
-            micIndicator.classList.remove('listening');
+        
+        function updateUIForState(state) {
+            statusSpan.textContent = state;
+            // This call remains important for handling state changes that don't involve audio playback.
+            startContinuousListening(); 
         }
+
         function handleTextMessage(message) {
             clearQuizOptions();
             if (message.type === 'state_update') {
@@ -503,6 +555,7 @@ html = """
                 displayQuizOptions(message.options);
             }
         }
+
         function displayQuizOptions(options) {
             options.forEach(optionText => {
                 const button = document.createElement('button');
@@ -511,7 +564,7 @@ html = """
                 button.onclick = () => {
                     const selectedOption = optionText.charAt(0);
                     addMessage(optionText, 'user');
-                    if (ws.readyState === WebSocket.OPEN) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'quiz_answer', answer: selectedOption }));
                     }
                     clearQuizOptions();
@@ -519,21 +572,29 @@ html = """
                 quizOptionsDiv.appendChild(button);
             });
         }
-        function clearQuizOptions() { quizOptionsDiv.innerHTML = ''; }
-        function updateUIForState(state) {
-            statusSpan.textContent = state;
-            if (state === 'QUIZ_QUESTION') {
-                stopContinuousListening();
-            } else {
-                startContinuousListening();
-            }
-        }
+        
         function addMessage(text, sender) {
             const messageElem = document.createElement('div');
             messageElem.classList.add('message', sender + '-message');
             messageElem.innerHTML = text.replace(/\\n/g, '<br>');
             conversationDiv.appendChild(messageElem);
             conversationDiv.scrollTop = conversationDiv.scrollHeight;
+        }
+
+        function clearQuizOptions() { quizOptionsDiv.innerHTML = ''; }
+
+        function setupSpeedControls() {
+            const speedButtons = document.querySelectorAll('.speed-button');
+            speedButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    speedButtons.forEach(btn => btn.classList.remove('active'));
+                    button.classList.add('active');
+                    const newRate = button.getAttribute('data-rate');
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'set_speed', rate: newRate }));
+                    }
+                });
+            });
         }
 
         document.getElementById('lesson-1-btn').onclick = initializeApp;
@@ -624,7 +685,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if msg_type == "set_speed":
                     new_rate = data.get("rate")
                     # Validate the input to prevent malicious SSML injection
-                    allowed_rates = ["+0.00%", "+13.00%", "+17.00%"]
+                    allowed_rates = ["+0.00%", "+11.50%", "+20.00%", "+50.00%"]
                     if new_rate in allowed_rates:
                         speech_rate = new_rate
                         logger.info(f"Client set speech rate to: {speech_rate}")
@@ -723,34 +784,47 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         await websocket.send_json({"type": "ai_response", "text": feedback})
         await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
 
-
-
+    # --- THIS IS THE NEW, ROBUST LOGIC BLOCK ---
     elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
+        dialogflow_result = await get_dialogflow_response(transcript, session_path)
+        intent_name = dialogflow_result.intent.display_name if dialogflow_result else ""
 
-        if current_state != AppState.QNA:
-            await transition_func(AppState.QNA)
+        # --- CLEAN 3-WAY LOGIC BRANCH ---
 
-        transcript_lower = transcript.lower().strip()
-        negative_responses = ["no", "nope", "nah", "i don't", "no thanks"]
-        is_negative = any(word in transcript_lower for word in negative_responses)
-
-        if current_state == AppState.LESSON_QNA and is_negative:
-            await advance_lesson_func()
-        else:
-            await transition_func(AppState.QNA)
-            if transcript_lower in ["yes", "yeah", "yep", "sure", "i do"]:
-                qna_prompt = "Great, what's your question?"
-                await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-                await stream_azure_tts_and_send_to_client(qna_prompt, websocket, speech_rate)
+        # 1. Did the user say NO?
+        if intent_name == 'DenyFollowup':
+            # If they say no during the lesson's specific Q&A point, advance the lesson.
+            if current_state == AppState.LESSON_QNA:
+                await advance_lesson_func()
             else:
-                response_text = await get_rag_response(transcript, session_path)
+                # If they say no during general Q&A, give a polite closing remark.
+                response_text = "Sounds good! Let's get started with the quiz."
                 await websocket.send_json({"type": "ai_response", "text": response_text})
                 await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-                
-                qna_follow_up = "Do you have any other questions?"
-                await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
-                await stream_azure_tts_and_send_to_client(qna_follow_up, websocket, speech_rate)
-                await transition_func(AppState.LESSON_QNA)
+                # Transition to a final, general QNA state.
+                await transition_func(AppState.QUIZ_START)
+
+        # 2. Did the user say YES (without asking the question)?
+        elif intent_name == 'ConfirmQuestion':
+            # Prompt them for the actual question.
+            response_text = "Great, what is your question?"
+            await websocket.send_json({"type": "ai_response", "text": response_text})
+            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
+            # Ensure we are in the general QNA state to await the answer.
+            await transition_func(AppState.QNA)
+
+        # 3. If it's not a clear "no" or "yes", it must be THE QUESTION.
+        else:
+            # Get the answer from the RAG system.
+            rag_answer = await get_rag_response(transcript, session_path)
+            # Combine the answer with the follow-up.
+            response_text = f"{rag_answer} Do you have any other questions?"
+            
+            # Send the combined text and audio.
+            await websocket.send_json({"type": "ai_response", "text": response_text})
+            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
+            # Stay in the general QNA state for the next turn.
+            await transition_func(AppState.QNA)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
@@ -797,24 +871,6 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
         sync_bridge_queue.put(chunk)
         if chunk is None: break
     await stt_thread
-
-async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
-    if not speech_config or not text:
-        logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
-        return
-
-    ssml_text = f"""
-    <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
-        <voice name="{speech_config.speech_synthesis_voice_name}">
-            <mstts:viseme type="redlips_front"/>
-            {text}
-        </voice>
-    </speak>
-    """
-    
-    loop = asyncio.get_running_loop()
-    synthesis_complete_future = loop.create_future()
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
 
 async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, rate: str):
     """
