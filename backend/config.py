@@ -1,26 +1,31 @@
 # backend/config.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
-from typing import Optional # Import Optional for optional types
-from dotenv import load_dotenv # Import load_dotenv
+from dotenv import load_dotenv
+from typing import Optional
 
-# Load environment variables from .env file immediately
+# Load environment variables from .env file.
+# This makes them available to the entire application before any other code runs.
 load_dotenv()
 
 class Settings(BaseSettings):
-    # Google Cloud Project ID
+    """
+    Defines the application's configuration settings, loaded from the .env file.
+    """
+    # Google Cloud settings
     GOOGLE_CLOUD_PROJECT_ID: str
+    GOOGLE_APPLICATION_CREDENTIALS: str
 
-    # Gemini API Key (if you're using the direct genai client, not Vertex AI with service accounts)
-    # Use Optional[str] or str | None to correctly indicate it can be a string or None
-    # It should NOT have a hardcoded default value here for security reasons.
-    GEMINI_API_KEY: Optional[str] = None
+    # Azure settings
+    AZURE_SPEECH_KEY: str
+    AZURE_SPEECH_REGION: str
 
+    # LangSmith settings (optional)
+    LANGCHAIN_TRACING_V2: Optional[str] = None
+    LANGCHAIN_API_KEY: Optional[str] = None
+    LANGCHAIN_PROJECT: Optional[str] = None
+
+    # This tells Pydantic to read from the .env file.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-# Load settings on startup
+# Create a single, globally accessible settings object
 settings = Settings()
-
-# DO NOT set GOOGLE_APPLICATION_CREDENTIALS here.
-# It should be set as an environment variable in your shell before running the app.
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")

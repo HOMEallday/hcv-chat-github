@@ -17,6 +17,7 @@ from google.api_core.exceptions import GoogleAPIError
 from google.cloud import dialogflow_v2 as dialogflow
 from google.cloud import speech_v1p1beta1 as speech
 from google.cloud import texttospeech_v1 as tts
+import azure.cognitiveservices.speech as speechsdk
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain_chroma import Chroma
@@ -25,7 +26,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from pydantic import BaseModel
 import vertexai
-from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocketState, WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed
 
 from config import settings
 
@@ -124,14 +126,30 @@ class UsageCallback(BaseCallbackHandler):
 # --- FastAPI Lifespan Manager (for startup and shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global speech_client, tts_client, dialogflow_sessions_client, retrieval_chain, gemini_llm
+    global speech_client, speech_config, dialogflow_sessions_client, retrieval_chain, gemini_llm # --- MODIFIED ---
     logger.info("--- Application Startup Initiated ---")
     try:
         # Initialize clients
         speech_client = speech.SpeechClient()
-        tts_client = tts.TextToSpeechClient()
         dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
-        vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID, location="us-central1")
+        vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID)
+
+        logger.info(f"Google clients initialized successfully for project: {settings.GOOGLE_CLOUD_PROJECT_ID}")
+
+        try:
+            speech_config = speechsdk.SpeechConfig(
+                subscription=settings.AZURE_SPEECH_KEY, 
+                region=settings.AZURE_SPEECH_REGION
+            )
+
+            speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
+            # Set the output format. MP3 is widely compatible.
+            speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
+            logger.info("Azure Speech Service configured successfully.")
+        except Exception as e:
+            logger.error(f"!!! FAILED to configure Azure Speech Service: {e} !!!")
+            speech_config = None
+
         gemini_llm = ChatVertexAI(
             model_name="gemini-2.5-flash",
             temperature=0.2,
@@ -286,6 +304,11 @@ html = """
         const stillImage = document.getElementById('character-still');
         const talkingVideo = document.getElementById('character-talking');
 
+        let ws, mediaStream, audioContext, workletNode, audioInput, vad;
+        let isPlaying = false;
+        let currentAudioSource = null; // To keep track of the playing audio
+        let currentAudioChunks = []; // To buffer incoming audio chunks
+
         const workletCode = `
             class AudioProcessor extends AudioWorkletProcessor {
                 process(inputs) {
@@ -297,9 +320,7 @@ html = """
             registerProcessor('audio-processor', AudioProcessor);
         `;
 
-        let ws, mediaStream, audioContext, workletNode, audioInput, vad;
-        let isPlaying = false;
-        let audioQueue = [];
+
 
         class VoiceActivityDetector {
             constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 1.0) {
@@ -354,34 +375,75 @@ html = """
             ws.onclose = () => { statusSpan.textContent = "Disconnected"; if (vad) vad.stop(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
             ws.onmessage = (event) => {
-                if (typeof event.data === 'string') handleTextMessage(JSON.parse(event.data));
-                else if (event.data instanceof Blob) { audioQueue.push(event.data); if (!isPlaying) playNextAudio(); }
+                if (event.data instanceof Blob) {
+                    // Buffer all incoming audio chunks
+                    currentAudioChunks.push(event.data);
+                } else if (typeof event.data === 'string') {
+                    const message = JSON.parse(event.data);
+                    
+                    if (message.type === 'tts_stream_finished') {
+                        // When the server confirms the stream is done, play the buffered audio
+                        playCombinedAudio();
+                    } else if (message.type === 'viseme') {
+                        // Viseme handling (for future animation) remains the same
+                        // console.log("Viseme:", message.viseme_id, "at", message.offset_ms, "ms");
+                    } else {
+                        // Handle all other text-based messages
+                        handleTextMessage(message);
+                    }
+                }
             };
         }
 
-        async function playNextAudio() {
-            if (vad) vad.stop();
-            if (audioQueue.length === 0) {
-                isPlaying = false;
-                talkingVideo.pause();
-                talkingVideo.style.display = 'none';
-                stillImage.style.display = 'block';
-                updateUIForState(statusSpan.textContent);
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
-                return;
-            }
+        async function playCombinedAudio() {
+            if (currentAudioChunks.length === 0 || !audioContext) return;
+            
             isPlaying = true;
+            if (vad) vad.stop(); // Stop listening while AI speaks
             updateUIForState(statusSpan.textContent);
             stillImage.style.display = 'none';
             talkingVideo.style.display = 'block';
+            talkingVideo.play();
 
-            const audioBlob = audioQueue.shift();
-            const audioUrl = URL.createObjectURL(audioBlob);
-            const audio = new Audio(audioUrl);
-            audio.onended = () => { URL.revokeObjectURL(audioUrl); playNextAudio(); };
-            audio.onerror = () => isPlaying = false;
-            try { await Promise.all([audio.play(), talkingVideo.play()]); }
-            catch (error) { isPlaying = false; }
+            // Combine all buffered chunks into a single Blob
+            const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mp3' });
+            currentAudioChunks = []; // Clear the buffer for the next utterance
+
+            try {
+                // Decode the Blob into a raw AudioBuffer for high-performance playback
+                const arrayBuffer = await audioBlob.arrayBuffer();
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+                // Stop any previously playing audio
+                if (currentAudioSource) {
+                    currentAudioSource.stop();
+                }
+
+                // Create a new source node, set its buffer, and connect to speakers
+                currentAudioSource = audioContext.createBufferSource();
+                currentAudioSource.buffer = audioBuffer;
+                currentAudioSource.connect(audioContext.destination);
+
+                // Set an 'onended' event to handle cleanup and state transitions
+                currentAudioSource.onended = () => {
+                    isPlaying = false;
+                    talkingVideo.pause();
+                    talkingVideo.style.display = 'none';
+                    stillImage.style.display = 'block';
+                    updateUIForState(statusSpan.textContent);
+                    // Inform the backend that TTS playback has finished
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
+                    }
+                };
+
+                // Start playback now
+                currentAudioSource.start(0);
+
+            } catch (e) {
+                console.error("Error decoding or playing audio:", e);
+                isPlaying = false;
+            }
         }
 
         async function startContinuousListening() {
@@ -500,20 +562,20 @@ async def websocket_endpoint(websocket: WebSocket):
             if step_data["type"] == "lecture":
                 await transition_to_state(AppState.LESSON_DELIVERY)
                 await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_tts_and_send_to_client(step_data["text"], websocket)
+                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
             elif step_data["type"] == "question":
                 await transition_to_state(AppState.LESSON_QUESTION)
                 await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_tts_and_send_to_client(step_data["text"], websocket)
+                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
             elif step_data["type"] == "qna_prompt":
                 await transition_to_state(AppState.LESSON_QNA)
                 await websocket.send_json({"type": "ai_response", "text": step_data["text"]})
-                await stream_tts_and_send_to_client(step_data["text"], websocket)
+                await stream_azure_tts_and_send_to_client(step_data["text"], websocket)
         else:
             await transition_to_state(AppState.QUIZ_START)
             end_text = "You've completed the lesson! Now for a final quiz."
             await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_tts_and_send_to_client(end_text, websocket)
+            await stream_azure_tts_and_send_to_client(end_text, websocket)
 
     async def advance_quiz():
         nonlocal quiz_step
@@ -528,18 +590,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 "options": question_data['options']
             })
             tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
-            await stream_tts_and_send_to_client(tts_text, websocket)
+            await stream_azure_tts_and_send_to_client(tts_text, websocket)
         else:
             await transition_to_state(AppState.QUIZ_COMPLETE)
             end_text = "You've completed the quiz! Great job."
             await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_tts_and_send_to_client(end_text, websocket)
+            await stream_azure_tts_and_send_to_client(end_text, websocket)
 
     try:
         await transition_to_state(AppState.INTRODUCTION)
         intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
         await websocket.send_json({"type": "ai_response", "text": intro_text})
-        await stream_tts_and_send_to_client(intro_text, websocket)
+        await stream_azure_tts_and_send_to_client(intro_text, websocket)
 
         while websocket.client_state == WebSocketState.CONNECTED:
             message = await websocket.receive()
@@ -571,7 +633,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     logger.info("Received empty transcript. Re-prompting user.")
                                     reprompt_text = "I didn't catch that. Could you please say it again?"
                                     await websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                                    await stream_tts_and_send_to_client(reprompt_text, websocket)
+                                    await stream_azure_tts_and_send_to_client(reprompt_text, websocket)
 
                             asyncio.create_task(result_handler())
 
@@ -599,7 +661,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     await transition_to_state(AppState.QUIZ_FEEDBACK)
                     await websocket.send_json({"type": "ai_response", "text": feedback})
-                    await stream_tts_and_send_to_client(feedback, websocket)
+                    await stream_azure_tts_and_send_to_client(feedback, websocket)
 
 
     except WebSocketDisconnect:
@@ -642,7 +704,7 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         user_name = extract_name(transcript)
         response_text = f"It's nice to meet you, {user_name}! Let's get started."
         await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_tts_and_send_to_client(response_text, websocket)
+        await stream_azure_tts_and_send_to_client(response_text, websocket)
         await transition_func(AppState.LESSON_PROLOGUE)
 
     elif current_state == AppState.LESSON_QUESTION:
@@ -650,7 +712,7 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
         feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
         await transition_func(AppState.LESSON_FEEDBACK)
         await websocket.send_json({"type": "ai_response", "text": feedback})
-        await stream_tts_and_send_to_client(feedback, websocket)
+        await stream_azure_tts_and_send_to_client(feedback, websocket)
 
     elif current_state == AppState.LESSON_QNA:
         transcript_lower = transcript.lower().strip()
@@ -664,25 +726,25 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
             if transcript_lower in ["yes", "yeah", "yep", "sure"]:
                 qna_prompt = "Great, what's your question?"
                 await websocket.send_json({"type": "ai_response", "text": qna_prompt})
-                await stream_tts_and_send_to_client(qna_prompt, websocket)
+                await stream_azure_tts_and_send_to_client(qna_prompt, websocket) 
             else:
                 # The user asked the question directly, so answer it immediately.
                 response_text = await get_rag_response(transcript, session_path)
                 await websocket.send_json({"type": "ai_response", "text": response_text})
-                await stream_tts_and_send_to_client(response_text, websocket)
+                await stream_azure_tts_and_send_to_client(response_text, websocket)
                 # Ask if they have more questions and wait for a new response.
                 qna_follow_up = "Do you have any other questions?"
                 await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
-                await stream_tts_and_send_to_client(qna_follow_up, websocket)
+                await stream_azure_tts_and_send_to_client(qna_follow_up, websocket)
                 await transition_func(AppState.LESSON_QNA)
 
     elif current_state == AppState.QNA:
         response_text = await get_rag_response(transcript, session_path)
         await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_tts_and_send_to_client(response_text, websocket)
+        await stream_azure_tts_and_send_to_client(response_text, websocket) 
         qna_follow_up = "Do you have any other questions?"
         await websocket.send_json({"type": "ai_response", "text": qna_follow_up})
-        await stream_tts_and_send_to_client(qna_follow_up, websocket)
+        await stream_azure_tts_and_send_to_client(qna_follow_up, websocket)
         await transition_func(AppState.LESSON_QNA)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
@@ -731,16 +793,99 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
         if chunk is None: break
     await stt_thread
 
-async def stream_tts_and_send_to_client(text_to_synthesize: str, websocket: WebSocket):
-    if not text_to_synthesize: return
-    synthesis_input = tts.SynthesisInput(text=text_to_synthesize)
-    voice = tts.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-C")
-    audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
-    try:
-        response = await asyncio.to_thread(
-            tts_client.synthesize_speech, input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_bytes(response.audio_content)
-    except Exception as e:
-        logger.error(f"Error during TTS synthesis: {e}")
+async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
+    if not speech_config or not text:
+        logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
+        return
+
+    ssml_text = f"""
+    <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
+        <voice name="{speech_config.speech_synthesis_voice_name}">
+            <mstts:viseme type="redlips_front"/>
+            {text}
+        </voice>
+    </speak>
+    """
+    
+    loop = asyncio.get_running_loop()
+    synthesis_complete_future = loop.create_future()
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+
+async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket):
+    if not speech_config or not text:
+        logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
+        return
+
+    
+    # We must escape XML characters like '&'
+    escaped_text = text.replace("&", "&").replace("<", "<").replace(">", ">")
+
+    ssml_text = f"""
+    <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
+        <voice name="{speech_config.speech_synthesis_voice_name}">
+            <mstts:express-as style="friendly">
+                <prosody rate="+13.00%" pitch="-5.00%">
+                    {escaped_text}
+                </prosody>
+            </mstts:express-as>
+            <mstts:silence type="Tailing" value="125ms"/>
+        </voice>
+    </speak>
+    """
+    
+    loop = asyncio.get_running_loop()
+    synthesis_complete_future = loop.create_future()
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+
+    # --- Async helper functions for safe sending (UNCHANGED) ---
+    async def safe_send_bytes(data: bytes):
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_bytes(data)
+        except (WebSocketDisconnect, ConnectionClosed):
+            logger.warning("WebSocket disconnected during TTS audio streaming.")
+            if not synthesis_complete_future.done():
+                synthesis_complete_future.set_result(False)
+    
+    async def safe_send_json(data: dict):
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json(data)
+        except (WebSocketDisconnect, ConnectionClosed):
+            logger.warning("WebSocket disconnected during TTS viseme streaming.")
+            if not synthesis_complete_future.done():
+                synthesis_complete_future.set_result(False)
+
+    # --- Synchronous Event Handlers (UNCHANGED) ---
+    def audio_chunk_handler(evt: speechsdk.SpeechSynthesisEventArgs):
+        asyncio.run_coroutine_threadsafe(safe_send_bytes(evt.result.audio_data), loop)
+
+    def viseme_handler(evt: speechsdk.SpeechSynthesisVisemeEventArgs):
+        viseme_data = {"type": "viseme", "offset_ms": evt.audio_offset / 10000, "viseme_id": evt.viseme_id}
+        asyncio.run_coroutine_threadsafe(safe_send_json(viseme_data), loop)
+    
+    def synthesis_complete_handler(evt: speechsdk.SpeechSynthesisEventArgs):
+        reason = evt.result.reason
+        if reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            asyncio.run_coroutine_threadsafe(safe_send_json({"type": "tts_stream_finished"}), loop)
+        elif reason != speechsdk.ResultReason.Canceled:
+            cancellation = speechsdk.SpeechSynthesisCancellationDetails.from_result(evt.result)
+            logger.error(f"Azure TTS Error: Reason={cancellation.reason}, Details={cancellation.error_details}")
+        
+        if not synthesis_complete_future.done():
+            synthesis_complete_future.set_result(True)
+
+    # --- Connect Handlers and Start Synthesis (UNCHANGED) ---
+    synthesizer.synthesizing.connect(audio_chunk_handler)
+    synthesizer.viseme_received.connect(viseme_handler)
+    synthesizer.synthesis_completed.connect(synthesis_complete_handler)
+    synthesizer.synthesis_canceled.connect(synthesis_complete_handler)
+    
+    synthesizer.start_speaking_ssml_async(ssml_text)
+    
+    await synthesis_complete_future
+
+    synthesizer.synthesizing.disconnect_all()
+    synthesizer.viseme_received.disconnect_all()
+    synthesizer.synthesis_completed.disconnect_all()
+    synthesizer.synthesis_canceled.disconnect_all()
