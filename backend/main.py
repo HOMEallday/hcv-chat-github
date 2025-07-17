@@ -257,7 +257,31 @@ html = """
 <head>
     <title>HCV Trainer</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 0; background-color: #f0f2f5; display: flex; flex-direction: column; height: 100vh; }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            /* Set the background GIF */
+            background-image: url('/static/landscape.gif');
+            background-size: cover; /* Ensures the GIF covers the whole screen */
+            background-position: center; /* Centers the GIF */
+            background-attachment: fixed; /* Prevents the GIF from scrolling */
+        }
+
+        /* This creates the faded overlay effect */
+        body::before {
+            content: '';
+            position: fixed; /* Covers the entire viewport */
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            /* This is the fading layer. A semi-transparent white. */
+            background-color: rgba(255, 255, 255, 0.275);
+            z-index: -1; /* Pushes this layer behind all other content */
+        }
         #startup-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(240, 242, 245, 0.95); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
         #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
         .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; cursor: pointer; border: 1px solid #ccc; background-color: #fff; }
@@ -265,8 +289,8 @@ html = """
         
         /* --- MODIFIED: Character Container Styles --- */
         #character-container {
-            height: 250px;
-            width: 250px;
+            height: 375px;
+            width: 375px;
             position: relative; /* This is key for layering */
             display: flex;
             justify-content: center;
@@ -290,7 +314,7 @@ html = """
             z-index: 10; /* Ensure it's on top of the base image */
         }
 
-        #chat-container { flex: 1; max-width: 800px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; display: flex; flex-direction: column; }
+        #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; display: flex; flex-direction: column; }
         #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
         .user-message { background-color: #0084ff; color: white; margin-left: auto; }
@@ -400,7 +424,15 @@ html = """
                 this.animationFrameId = requestAnimationFrame(this.monitor);
             }
         }
-
+        document.addEventListener('DOMContentLoaded', () => {
+            const completedLessons = JSON.parse(localStorage.getItem('completedLessons')) || [];
+            if (completedLessons.includes(1)) {
+                const lesson1Btn = document.getElementById('lesson-1-btn');
+                lesson1Btn.textContent = 'Lesson 1: Program Fundamentals (Completed)';
+                lesson1Btn.style.backgroundColor = '#d4edda'; // A light green color
+                lesson1Btn.style.borderColor = '#c3e6cb';
+            }
+        });
         async function initializeApp() {
             document.getElementById('startup-overlay').style.display = 'none';
             if (!audioContext) {
@@ -511,7 +543,7 @@ html = """
 
             const state = statusSpan.textContent;
             const isConversational = [
-                'INTRODUCTION', 'LESSON_QUESTION', 'LESSON_QNA', 'QNA', 'QUIZ_COMPLETE'
+                'INTRODUCTION', 'LESSON_QUESTION', 'LESSON_QNA', 'QNA'
             ].includes(state);
 
             if (!isConversational) return;
@@ -553,6 +585,27 @@ html = """
             } else if (message.type === 'quiz_question') {
                 addMessage(message.text, 'ai');
                 displayQuizOptions(message.options);
+            } 
+            // --- NEW CASE ---
+            else if (message.type === 'quiz_summary') {
+                // 1. Display the summary text in the chat
+                addMessage(message.text, 'ai');
+
+                // 2. Mark the lesson as complete in localStorage
+                let completedLessons = JSON.parse(localStorage.getItem('completedLessons')) || [];
+                if (!completedLessons.includes(message.lesson_id)) {
+                    completedLessons.push(message.lesson_id);
+                    localStorage.setItem('completedLessons', JSON.stringify(completedLessons));
+                }
+
+                // 3. Create the "Return to Menu" button
+                const returnBtn = document.createElement('button');
+                returnBtn.className = 'lesson-button';
+                returnBtn.textContent = 'Return to Lesson Menu';
+                returnBtn.onclick = () => {
+                    window.location.reload(); // Simple way to reset and go to the menu
+                };
+                quizOptionsDiv.appendChild(returnBtn);
             }
         }
 
@@ -620,6 +673,8 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_input_queue = None
     lesson_step = 0
     quiz_step = 0
+    # --- NEW: Variable to track the quiz score ---
+    quiz_score = 0
 
     async def transition_to_state(new_state: AppState):
         nonlocal current_state
@@ -644,11 +699,13 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "ai_response", "text": text})
             await stream_azure_tts_and_send_to_client(text, websocket, speech_rate)
         else:
+            # This path is taken if the user says "no" to the mid-lesson Q&A
+            response_text = "Okay, let's start the final quiz."
+            await websocket.send_json({"type": "ai_response", "text": response_text})
+            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
             await transition_to_state(AppState.QUIZ_START)
-            end_text = "You've completed the lesson! Now for a final quiz."
-            await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_azure_tts_and_send_to_client(end_text, websocket, speech_rate)
 
+    # --- MODIFIED: The advance_quiz function is completely new ---
     async def advance_quiz():
         nonlocal quiz_step
         if quiz_step < len(quiz_questions):
@@ -663,10 +720,22 @@ async def websocket_endpoint(websocket: WebSocket):
             tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
             await stream_azure_tts_and_send_to_client(tts_text, websocket, speech_rate)
         else:
+            # --- NEW: This is the final summary logic ---
             await transition_to_state(AppState.QUIZ_COMPLETE)
-            end_text = "You've completed the quiz! Great job."
-            await websocket.send_json({"type": "ai_response", "text": end_text})
-            await stream_azure_tts_and_send_to_client(end_text, websocket, speech_rate)
+            
+            # 1. Create the summary text
+            summary_text = f"You've completed the quiz! You scored {quiz_score} out of {len(quiz_questions)}. Great job."
+            
+            # 2. Send a special message type to the frontend
+            await websocket.send_json({
+                "type": "quiz_summary",
+                "text": summary_text,
+                "lesson_id": 1 # To mark Lesson 1 as complete
+            })
+            
+            # 3. Send the audio for the summary
+            await stream_azure_tts_and_send_to_client(summary_text, websocket, speech_rate)
+
     try:
         await transition_to_state(AppState.INTRODUCTION)
         intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
@@ -681,17 +750,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
 
-                # --- NEW: Handle messages to update the speech rate ---
                 if msg_type == "set_speed":
                     new_rate = data.get("rate")
-                    # Validate the input to prevent malicious SSML injection
                     allowed_rates = ["+0.00%", "+11.50%", "+20.00%", "+50.00%"]
                     if new_rate in allowed_rates:
                         speech_rate = new_rate
                         logger.info(f"Client set speech rate to: {speech_rate}")
-                    else:
-                        logger.warning(f"Client sent invalid speech rate: {new_rate}")
-
+                
                 elif msg_type == "control":
                     command = data.get("command")
                     if command == "start_speech":
@@ -722,14 +787,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     elif command == "tts_finished":
                         if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
                             await advance_lesson()
+                        # --- MODIFIED: This now correctly triggers the first quiz question ---
                         elif current_state == AppState.QUIZ_START or current_state == AppState.QUIZ_FEEDBACK:
                             await advance_quiz()
                 
+                # --- MODIFIED: This now increments the score ---
                 elif msg_type == "quiz_answer":
                     answer = data.get("answer")
                     question_data = quiz_questions[quiz_step - 1]
                     is_correct = (answer == question_data['correct_answer'])
-                    feedback = "Correct!" if is_correct else f"Not quite. The correct answer was {question_data['correct_answer']}."
+                    if is_correct:
+                        quiz_score += 1 # Increment score on correct answer
+                        feedback = "Correct!"
+                    else:
+                        feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
+                    
                     await transition_to_state(AppState.QUIZ_FEEDBACK)
                     await websocket.send_json({"type": "ai_response", "text": feedback})
                     await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
