@@ -107,7 +107,7 @@ class ConnectionManager:
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
         self.current_state = AppState.IDLE
-        self.speech_rate = "+11.50%"
+        self.speech_rate = "+13.00%"
         self.dialogflow_session_path = ""
         self.audio_input_queue: Optional[asyncio.Queue] = None
         self.lesson_step = 0
@@ -155,12 +155,7 @@ class ConnectionManager:
             await stream_azure_tts_and_send_to_client(summary_text, self.websocket, self.speech_rate)
 
     async def handle_response_by_state(self, transcript: str):
-        # This is the "cool-down" period. 250ms is enough for the browser to reset
-        # but short enough that the user won't perceive it as lag.
-        await asyncio.sleep(0.25)
-
         await self.websocket.send_json({"type": "user_transcript", "text": transcript})
-        
         if self.current_state == AppState.INTRODUCTION:
             user_name = extract_name(transcript)
             response_text = f"It's nice to meet you, {user_name}! Let's get started."
@@ -168,7 +163,6 @@ class ConnectionManager:
             await asyncio.sleep(0.01)
             await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
             await self.transition_to_state(AppState.LESSON_PROLOGUE)
-
         elif self.current_state == AppState.LESSON_QUESTION:
             step_data = lesson_flow[self.lesson_step - 1]
             feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
@@ -176,11 +170,8 @@ class ConnectionManager:
             await self.websocket.send_json({"type": "ai_response", "text": feedback})
             await asyncio.sleep(0.01)
             await stream_azure_tts_and_send_to_client(feedback, self.websocket, self.speech_rate)
-            
         elif self.current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
             dialogflow_result = await get_dialogflow_response(transcript, self.dialogflow_session_path)
-            
-            # This logic block handles all other spoken replies
             if isinstance(dialogflow_result, str) or dialogflow_result.intent.display_name == 'Default Fallback Intent':
                 rag_answer = await get_rag_response(transcript, self.dialogflow_session_path)
                 response_text = f"{rag_answer} Do you have any other questions?"
@@ -189,8 +180,7 @@ class ConnectionManager:
                 await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
                 await self.transition_to_state(AppState.QNA)
             elif dialogflow_result.intent.display_name == 'DenyFollowup':
-                if self.current_state == AppState.LESSON_QNA:
-                    await self.advance_lesson()
+                if self.current_state == AppState.LESSON_QNA: await self.advance_lesson()
                 else:
                     response_text = "Sounds good! Let's get started with the quiz."
                     await self.websocket.send_json({"type": "ai_response", "text": response_text})
@@ -203,7 +193,7 @@ class ConnectionManager:
                 await asyncio.sleep(0.01)
                 await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
                 await self.transition_to_state(AppState.QNA)
-            else: # Handle standard Dialogflow fulfillment
+            else:
                 await self.websocket.send_json({"type": "ai_response", "text": dialogflow_result.fulfillment_text})
                 await asyncio.sleep(0.01)
                 await stream_azure_tts_and_send_to_client(dialogflow_result.fulfillment_text, self.websocket, self.speech_rate)
@@ -217,59 +207,18 @@ class ConnectionManager:
             command = data.get("command")
             if command == "start_speech":
                 if self.audio_input_queue is None:
-                    self.audio_input_queue = asyncio.Queue()
-                    stt_results_queue = asyncio.Queue()
+                    self.audio_input_queue = asyncio.Queue(); stt_results_queue = asyncio.Queue()
                     session_id = f"{self.websocket.client.host}-{self.websocket.client.port}-{time.time()}"
                     self.dialogflow_session_path = dialogflow_sessions_client.session_path(settings.GOOGLE_CLOUD_PROJECT_ID, session_id)
                     self.stt_task = asyncio.create_task(transcribe_speech(self.audio_input_queue, stt_results_queue))
-
-                    # --- THIS IS THE NEW, INTELLIGENT HANDLER ---
                     async def result_handler():
                         transcript = await stt_results_queue.get()
-                        
-                        if not transcript:
+                        if transcript: await self.handle_response_by_state(transcript)
+                        else:
                             reprompt_text = "I didn't catch that. Could you please say it again?"
                             await self.websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                            await asyncio.sleep(0.01) # Small sleep for network buffer
+                            await asyncio.sleep(0.01)
                             await stream_azure_tts_and_send_to_client(reprompt_text, self.websocket, self.speech_rate)
-                            return
-
-                        # Immediately show the user what we heard for instant feedback
-                        await self.websocket.send_json({"type": "user_transcript", "text": transcript})
-                        
-                        # Start the timer
-                        start_time = time.monotonic()
-                        
-                        # --- Do the heavy processing to get the reply ---
-                        # This is a simplified version of your handle_response_by_state logic
-                        # to determine the bot's next action and text.
-                        # You would integrate your full logic here.
-                        
-                        # For this example, let's just use the introduction logic
-                        user_name = extract_name(transcript)
-                        response_text = f"It's nice to meet you, {user_name}! Let's get started."
-                        next_state = AppState.LESSON_PROLOGUE
-                        # (In a real scenario, you'd have your full if/elif chain here for different states)
-
-                        # Stop the timer
-                        end_time = time.monotonic()
-                        processing_time = end_time - start_time
-                        
-                        # --- Calculate the "Smart Wait" ---
-                        cooldown_period = 0.25 # 250ms
-                        if processing_time < cooldown_period:
-                            sleep_duration = cooldown_period - processing_time
-                            logger.info(f"Processing took {processing_time:.2f}s. Waiting an additional {sleep_duration:.2f}s for browser cool-down.")
-                            await asyncio.sleep(sleep_duration)
-                        else:
-                            logger.info(f"Processing took {processing_time:.2f}s. No extra wait needed.")
-
-                        # --- Now, deliver the result ---
-                        await self.websocket.send_json({"type": "ai_response", "text": response_text})
-                        await asyncio.sleep(0.01)
-                        await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
-                        await self.transition_to_state(next_state)
-
                     self.result_task = asyncio.create_task(result_handler())
             elif command == "end_speech":
                 if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None
@@ -308,6 +257,7 @@ class ConnectionManager:
             if self.stt_task and not self.stt_task.done(): self.stt_task.cancel()
             if self.result_task and not self.result_task.done(): self.result_task.cancel()
             logger.info("WebSocket connection resources cleaned up.")
+
 # --- LangChain Callback for Token Usage ---
 class UsageCallback(BaseCallbackHandler):
     def __init__(self):
