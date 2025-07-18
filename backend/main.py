@@ -103,8 +103,211 @@ quiz_questions = [
         "correct_answer": "C"
     }
 ]
+class ConnectionManager:
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+        self.current_state = AppState.IDLE
+        self.speech_rate = "+11.50%"
+        self.dialogflow_session_path = ""
+        self.audio_input_queue: Optional[asyncio.Queue] = None
+        self.lesson_step = 0
+        self.quiz_step = 0
+        self.quiz_score = 0
+        self.stt_task: Optional[asyncio.Task] = None
+        self.result_task: Optional[asyncio.Task] = None
 
+    async def transition_to_state(self, new_state: AppState):
+        self.current_state = new_state
+        await self.websocket.send_json({"type": "state_update", "state": self.current_state.value})
 
+    async def advance_lesson(self):
+        if self.lesson_step < len(lesson_flow):
+            step_data = lesson_flow[self.lesson_step]
+            self.lesson_step += 1
+            text = step_data["text"]
+            if step_data["type"] == "lecture": await self.transition_to_state(AppState.LESSON_DELIVERY)
+            elif step_data["type"] == "question": await self.transition_to_state(AppState.LESSON_QUESTION)
+            elif step_data["type"] == "qna_prompt": await self.transition_to_state(AppState.LESSON_QNA)
+            await self.websocket.send_json({"type": "ai_response", "text": text})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(text, self.websocket, self.speech_rate)
+        else:
+            response_text = "Okay, let's start the final quiz."
+            await self.websocket.send_json({"type": "ai_response", "text": response_text})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+            await self.transition_to_state(AppState.QUIZ_START)
+
+    async def advance_quiz(self):
+        if self.quiz_step < len(quiz_questions):
+            question_data = quiz_questions[self.quiz_step]
+            self.quiz_step += 1
+            await self.transition_to_state(AppState.QUIZ_QUESTION)
+            await self.websocket.send_json({"type": "quiz_question", "text": question_data['text'], "options": question_data['options']})
+            await asyncio.sleep(0.01)
+            tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
+            await stream_azure_tts_and_send_to_client(tts_text, self.websocket, self.speech_rate)
+        else:
+            await self.transition_to_state(AppState.QUIZ_COMPLETE)
+            summary_text = f"You've completed the quiz! You scored {self.quiz_score} out of {len(quiz_questions)}. Great job."
+            await self.websocket.send_json({"type": "quiz_summary", "text": summary_text, "lesson_id": 1})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(summary_text, self.websocket, self.speech_rate)
+
+    async def handle_response_by_state(self, transcript: str):
+        # This is the "cool-down" period. 250ms is enough for the browser to reset
+        # but short enough that the user won't perceive it as lag.
+        await asyncio.sleep(0.25)
+
+        await self.websocket.send_json({"type": "user_transcript", "text": transcript})
+        
+        if self.current_state == AppState.INTRODUCTION:
+            user_name = extract_name(transcript)
+            response_text = f"It's nice to meet you, {user_name}! Let's get started."
+            await self.websocket.send_json({"type": "ai_response", "text": response_text})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+            await self.transition_to_state(AppState.LESSON_PROLOGUE)
+
+        elif self.current_state == AppState.LESSON_QUESTION:
+            step_data = lesson_flow[self.lesson_step - 1]
+            feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
+            await self.transition_to_state(AppState.LESSON_FEEDBACK)
+            await self.websocket.send_json({"type": "ai_response", "text": feedback})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(feedback, self.websocket, self.speech_rate)
+            
+        elif self.current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
+            dialogflow_result = await get_dialogflow_response(transcript, self.dialogflow_session_path)
+            
+            # This logic block handles all other spoken replies
+            if isinstance(dialogflow_result, str) or dialogflow_result.intent.display_name == 'Default Fallback Intent':
+                rag_answer = await get_rag_response(transcript, self.dialogflow_session_path)
+                response_text = f"{rag_answer} Do you have any other questions?"
+                await self.websocket.send_json({"type": "ai_response", "text": response_text})
+                await asyncio.sleep(0.01)
+                await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+                await self.transition_to_state(AppState.QNA)
+            elif dialogflow_result.intent.display_name == 'DenyFollowup':
+                if self.current_state == AppState.LESSON_QNA:
+                    await self.advance_lesson()
+                else:
+                    response_text = "Sounds good! Let's get started with the quiz."
+                    await self.websocket.send_json({"type": "ai_response", "text": response_text})
+                    await asyncio.sleep(0.01)
+                    await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+                    await self.transition_to_state(AppState.QUIZ_START)
+            elif dialogflow_result.intent.display_name == 'ConfirmQuestion':
+                response_text = "Great, what is your question?"
+                await self.websocket.send_json({"type": "ai_response", "text": response_text})
+                await asyncio.sleep(0.01)
+                await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+                await self.transition_to_state(AppState.QNA)
+            else: # Handle standard Dialogflow fulfillment
+                await self.websocket.send_json({"type": "ai_response", "text": dialogflow_result.fulfillment_text})
+                await asyncio.sleep(0.01)
+                await stream_azure_tts_and_send_to_client(dialogflow_result.fulfillment_text, self.websocket, self.speech_rate)
+    
+    async def handle_text_message(self, data: dict):
+        msg_type = data.get("type")
+        if msg_type == "set_speed":
+            new_rate = data.get("rate");
+            if new_rate in ["+0.00%", "+11.50%", "+20.00%", "+50.00%"]: self.speech_rate = new_rate
+        elif msg_type == "control":
+            command = data.get("command")
+            if command == "start_speech":
+                if self.audio_input_queue is None:
+                    self.audio_input_queue = asyncio.Queue()
+                    stt_results_queue = asyncio.Queue()
+                    session_id = f"{self.websocket.client.host}-{self.websocket.client.port}-{time.time()}"
+                    self.dialogflow_session_path = dialogflow_sessions_client.session_path(settings.GOOGLE_CLOUD_PROJECT_ID, session_id)
+                    self.stt_task = asyncio.create_task(transcribe_speech(self.audio_input_queue, stt_results_queue))
+
+                    # --- THIS IS THE NEW, INTELLIGENT HANDLER ---
+                    async def result_handler():
+                        transcript = await stt_results_queue.get()
+                        
+                        if not transcript:
+                            reprompt_text = "I didn't catch that. Could you please say it again?"
+                            await self.websocket.send_json({"type": "ai_response", "text": reprompt_text})
+                            await asyncio.sleep(0.01) # Small sleep for network buffer
+                            await stream_azure_tts_and_send_to_client(reprompt_text, self.websocket, self.speech_rate)
+                            return
+
+                        # Immediately show the user what we heard for instant feedback
+                        await self.websocket.send_json({"type": "user_transcript", "text": transcript})
+                        
+                        # Start the timer
+                        start_time = time.monotonic()
+                        
+                        # --- Do the heavy processing to get the reply ---
+                        # This is a simplified version of your handle_response_by_state logic
+                        # to determine the bot's next action and text.
+                        # You would integrate your full logic here.
+                        
+                        # For this example, let's just use the introduction logic
+                        user_name = extract_name(transcript)
+                        response_text = f"It's nice to meet you, {user_name}! Let's get started."
+                        next_state = AppState.LESSON_PROLOGUE
+                        # (In a real scenario, you'd have your full if/elif chain here for different states)
+
+                        # Stop the timer
+                        end_time = time.monotonic()
+                        processing_time = end_time - start_time
+                        
+                        # --- Calculate the "Smart Wait" ---
+                        cooldown_period = 0.25 # 250ms
+                        if processing_time < cooldown_period:
+                            sleep_duration = cooldown_period - processing_time
+                            logger.info(f"Processing took {processing_time:.2f}s. Waiting an additional {sleep_duration:.2f}s for browser cool-down.")
+                            await asyncio.sleep(sleep_duration)
+                        else:
+                            logger.info(f"Processing took {processing_time:.2f}s. No extra wait needed.")
+
+                        # --- Now, deliver the result ---
+                        await self.websocket.send_json({"type": "ai_response", "text": response_text})
+                        await asyncio.sleep(0.01)
+                        await stream_azure_tts_and_send_to_client(response_text, self.websocket, self.speech_rate)
+                        await self.transition_to_state(next_state)
+
+                    self.result_task = asyncio.create_task(result_handler())
+            elif command == "end_speech":
+                if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None
+            elif command == "tts_finished":
+                if self.current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]: await self.advance_lesson()
+                elif self.current_state in [AppState.QUIZ_START, AppState.QUIZ_FEEDBACK]: await self.advance_quiz()
+        elif msg_type == "quiz_answer":
+            answer = data.get("answer"); question_data = quiz_questions[self.quiz_step - 1]
+            if answer == question_data['correct_answer']: self.quiz_score += 1; feedback = "Correct!"
+            else: feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
+            await self.transition_to_state(AppState.QUIZ_FEEDBACK)
+            await self.websocket.send_json({"type": "ai_response", "text": feedback})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(feedback, self.websocket, self.speech_rate)
+
+    async def run(self):
+        try:
+            await self.transition_to_state(AppState.INTRODUCTION)
+            await asyncio.sleep(0.01)
+            intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
+            await self.websocket.send_json({"type": "ai_response", "text": intro_text})
+            await asyncio.sleep(0.01)
+            await stream_azure_tts_and_send_to_client(intro_text, self.websocket, self.speech_rate)
+            while self.websocket.client_state == WebSocketState.CONNECTED:
+                message = await self.websocket.receive()
+                if "bytes" in message:
+                    if self.audio_input_queue: await self.audio_input_queue.put(message["bytes"])
+                elif "text" in message:
+                    await self.handle_text_message(json.loads(message["text"]))
+        except WebSocketDisconnect:
+            logger.info("Client disconnected.")
+        except Exception as e:
+            logger.error(f"Error in connection handler: {e}", exc_info=True)
+        finally:
+            logger.info("Connection closed. Cleaning up background tasks...")
+            if self.stt_task and not self.stt_task.done(): self.stt_task.cancel()
+            if self.result_task and not self.result_task.done(): self.result_task.cancel()
+            logger.info("WebSocket connection resources cleaned up.")
 # --- LangChain Callback for Token Usage ---
 class UsageCallback(BaseCallbackHandler):
     def __init__(self):
@@ -657,161 +860,11 @@ html = """
 """
 
 # --- Main Endpoints ---
-@app.get("/")
-async def get():
-    return HTMLResponse(html)
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("WebSocket connection established.")
-
-    # --- STATE MANAGEMENT ---
-    current_state = AppState.IDLE
-    speech_rate = "+13.00%" 
-    dialogflow_session_path = ""
-    audio_input_queue = None
-    lesson_step = 0
-    quiz_step = 0
-    # --- NEW: Variable to track the quiz score ---
-    quiz_score = 0
-
-    async def transition_to_state(new_state: AppState):
-        nonlocal current_state
-        current_state = new_state
-        logger.info(f"Transitioning to state: {current_state.value}")
-        await websocket.send_json({"type": "state_update", "state": current_state.value})
-
-    async def advance_lesson():
-        nonlocal lesson_step
-        if lesson_step < len(lesson_flow):
-            step_data = lesson_flow[lesson_step]
-            lesson_step += 1
-            text = step_data["text"]
-
-            if step_data["type"] == "lecture":
-                await transition_to_state(AppState.LESSON_DELIVERY)
-            elif step_data["type"] == "question":
-                await transition_to_state(AppState.LESSON_QUESTION)
-            elif step_data["type"] == "qna_prompt":
-                await transition_to_state(AppState.LESSON_QNA)
-
-            await websocket.send_json({"type": "ai_response", "text": text})
-            await stream_azure_tts_and_send_to_client(text, websocket, speech_rate)
-        else:
-            # This path is taken if the user says "no" to the mid-lesson Q&A
-            response_text = "Okay, let's start the final quiz."
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            await transition_to_state(AppState.QUIZ_START)
-
-    # --- MODIFIED: The advance_quiz function is completely new ---
-    async def advance_quiz():
-        nonlocal quiz_step
-        if quiz_step < len(quiz_questions):
-            question_data = quiz_questions[quiz_step]
-            quiz_step += 1
-            await transition_to_state(AppState.QUIZ_QUESTION)
-            await websocket.send_json({
-                "type": "quiz_question", 
-                "text": question_data['text'],
-                "options": question_data['options']
-            })
-            tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
-            await stream_azure_tts_and_send_to_client(tts_text, websocket, speech_rate)
-        else:
-            # --- NEW: This is the final summary logic ---
-            await transition_to_state(AppState.QUIZ_COMPLETE)
-            
-            # 1. Create the summary text
-            summary_text = f"You've completed the quiz! You scored {quiz_score} out of {len(quiz_questions)}. Great job."
-            
-            # 2. Send a special message type to the frontend
-            await websocket.send_json({
-                "type": "quiz_summary",
-                "text": summary_text,
-                "lesson_id": 1 # To mark Lesson 1 as complete
-            })
-            
-            # 3. Send the audio for the summary
-            await stream_azure_tts_and_send_to_client(summary_text, websocket, speech_rate)
-
-    try:
-        await transition_to_state(AppState.INTRODUCTION)
-        intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
-        await websocket.send_json({"type": "ai_response", "text": intro_text})
-        await stream_azure_tts_and_send_to_client(intro_text, websocket, speech_rate)
-
-        while websocket.client_state == WebSocketState.CONNECTED:
-            message = await websocket.receive()
-            if "bytes" in message:
-                if audio_input_queue: await audio_input_queue.put(message["bytes"])
-            elif "text" in message:
-                data = json.loads(message["text"])
-                msg_type = data.get("type")
-
-                if msg_type == "set_speed":
-                    new_rate = data.get("rate")
-                    allowed_rates = ["+0.00%", "+11.50%", "+20.00%", "+50.00%"]
-                    if new_rate in allowed_rates:
-                        speech_rate = new_rate
-                        logger.info(f"Client set speech rate to: {speech_rate}")
-                
-                elif msg_type == "control":
-                    command = data.get("command")
-                    if command == "start_speech":
-                        if audio_input_queue is None:
-                            audio_input_queue = asyncio.Queue()
-                            stt_results_queue = asyncio.Queue()
-                            session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
-                            dialogflow_session_path = dialogflow_sessions_client.session_path(
-                                settings.GOOGLE_CLOUD_PROJECT_ID, session_id
-                            )
-                            asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
-
-                            async def result_handler():
-                                transcript = await stt_results_queue.get()
-                                if transcript:
-                                    # --- MODIFIED: Pass speech_rate to the handler ---
-                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, speech_rate)
-                                else:
-                                    reprompt_text = "I didn't catch that. Could you please say it again?"
-                                    await websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                                    await stream_azure_tts_and_send_to_client(reprompt_text, websocket, speech_rate)
-                            asyncio.create_task(result_handler())
-
-                    elif command == "end_speech":
-                        if audio_input_queue:
-                            await audio_input_queue.put(None)
-                            audio_input_queue = None
-                    elif command == "tts_finished":
-                        if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
-                            await advance_lesson()
-                        # --- MODIFIED: This now correctly triggers the first quiz question ---
-                        elif current_state == AppState.QUIZ_START or current_state == AppState.QUIZ_FEEDBACK:
-                            await advance_quiz()
-                
-                # --- MODIFIED: This now increments the score ---
-                elif msg_type == "quiz_answer":
-                    answer = data.get("answer")
-                    question_data = quiz_questions[quiz_step - 1]
-                    is_correct = (answer == question_data['correct_answer'])
-                    if is_correct:
-                        quiz_score += 1 # Increment score on correct answer
-                        feedback = "Correct!"
-                    else:
-                        feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
-                    
-                    await transition_to_state(AppState.QUIZ_FEEDBACK)
-                    await websocket.send_json({"type": "ai_response", "text": feedback})
-                    await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
-
-    except WebSocketDisconnect:
-        logger.info("Client disconnected.")
-    except Exception as e:
-        logger.error(f"Error in websocket endpoint: {e}", exc_info=True)
-    finally:
-        logger.info("WebSocket connection closed.")
+    manager = ConnectionManager(websocket)
+    await manager.run()
 
 # --- Helper Functions ---
 def extract_name(transcript: str) -> str:
