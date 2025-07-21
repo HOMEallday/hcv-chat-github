@@ -380,7 +380,7 @@ html = """
             z-index: 10; /* Ensure it's on top of the base image */
         }
 
-        #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); height: 550px; display: flex; flex-direction: column; }
+        #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); height: 600px; display: flex; flex-direction: column; }
         #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
         .user-message { background-color: #0084ff; color: white; margin-left: auto; }
@@ -400,6 +400,7 @@ html = """
         <div id="lesson-menu">
             <h2>HCV Training Program</h2>
             <button id="lesson-1-btn" class="lesson-button">Lesson 1: Program Fundamentals</button>
+            <button id="skip-to-quiz-btn" class="lesson-button" style="background-color: #fffbe6;">Skip to Quiz (Dev)</button>
             <button class="lesson-button" disabled>Lesson 2: Advanced Eligibility (Coming Soon...)</button>
             <button class="lesson-button" disabled>Lesson 3: Rent Calculation (Coming Soon...)</button>
             <button class="lesson-button" disabled>Lesson 4: Inspections & Standards (Coming Soon...)</button>
@@ -516,9 +517,15 @@ html = """
             connect();
         }
 
-        function connect() {
+        function connect(onOpenCallback) {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onopen = () => { console.log("WebSocket connected."); setupSpeedControls(); };
+            ws.onopen = () => {
+                console.log("WebSocket connected.");
+                setupSpeedControls();
+                if (onOpenCallback) {
+                    onOpenCallback(); // <<< CALL THE CALLBACK
+                }
+            };
             ws.onclose = () => { statusSpan.textContent = "Disconnected"; stopContinuousListening(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
             
@@ -684,6 +691,7 @@ html = """
                 button.className = 'lesson-button quiz-button';
                 button.innerHTML = optionText;
                 button.onclick = () => {
+                    interruptSpeech();
                     const selectedOption = optionText.charAt(0);
                     addMessage(optionText, 'user');
                     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -719,7 +727,70 @@ html = """
             });
         }
 
-        document.getElementById('lesson-1-btn').onclick = initializeApp;
+        // This is the original function for starting the full lesson
+        async function startFullLesson() {
+            document.getElementById('startup-overlay').style.display = 'none';
+            if (!audioContext) {
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
+                    workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                } catch (e) { console.error("Error initializing audio context:", e); return; }
+            }
+            await audioContext.resume();
+            connect(); // Connect with no special callback, starting the default flow
+        }
+
+        // --- NEW: This function handles the "skip to quiz" logic ---
+        async function skipToQuiz() {
+            document.getElementById('startup-overlay').style.display = 'none';
+            if (!audioContext) {
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
+                    workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                } catch (e) { console.error("Error initializing audio context:", e); return; }
+            }
+            await audioContext.resume();
+            // Connect and provide a callback function to be executed on connection
+            connect(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    console.log("Sending skip_to_quiz command...");
+                    ws.send(JSON.stringify({ type: 'skip_to_quiz' }));
+                }
+            });
+        }
+
+        function interruptSpeech() {
+            // 1. Stop any audio source that is currently playing.
+            if (currentAudioSource) {
+                currentAudioSource.stop();
+                currentAudioSource.onended = null; // Prevent the old onended event from firing
+                currentAudioSource = null;
+            }
+
+            // 2. Cancel the animation loop.
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
+
+            // 3. Reset all state variables and data queues.
+            isPlaying = false;
+            currentAudioChunks = []; // Crucially, clear out old audio chunks
+            visemeQueue = [];       // And old viseme data
+
+            // 4. Reset the character's mouth to the neutral, closed position.
+            visemeMouth.src = visemeMap[0];
+
+            console.log("Speech interrupted by user action. Audio system reset.");
+        }
+
+        // Assign the functions to the correct buttons
+        document.getElementById('lesson-1-btn').onclick = startFullLesson;
+        document.getElementById('skip-to-quiz-btn').onclick = skipToQuiz;
     </script>
 </body>
 </html>
@@ -825,7 +896,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     if new_rate in allowed_rates:
                         speech_rate = new_rate
                         logger.info(f"Client set speech rate to: {speech_rate}")
-                
+
+                elif msg_type == "skip_to_quiz":
+                    logger.info(">>> Developer command: Skipping to quiz.")
+                    response_text = "Okay, skipping directly to the quiz."
+                    await websocket.send_json({"type": "ai_response", "text": response_text})
+                    # We transition the state and let the tts_finished handler do the rest
+                    await transition_to_state(AppState.QUIZ_START)
+                    await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
+
                 elif msg_type == "control":
                     command = data.get("command")
                     if command == "start_speech":
