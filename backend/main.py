@@ -334,6 +334,9 @@ html = """
         <div id="lesson-menu">
             <h2>HCV Training Program</h2>
             <button id="lesson-1-btn" class="lesson-button">Lesson 1: Program Fundamentals</button>
+            <button class="lesson-button" disabled>Lesson 2: Advanced Eligibility (Coming Soon...)</button>
+            <button class="lesson-button" disabled>Lesson 3: Rent Calculation (Coming Soon...)</button>
+            <button class="lesson-button" disabled>Lesson 4: Inspections & Standards (Coming Soon...)</button>
         </div>
     </div>
     <div id="main-content">
