@@ -571,7 +571,7 @@ html = """
         function updateUIForState(state) {
             statusSpan.textContent = state;
             // This call remains important for handling state changes that don't involve audio playback.
-            startContinuousListening(); 
+            //startContinuousListening(); 
         }
 
         function handleTextMessage(message) {
@@ -668,7 +668,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # --- STATE MANAGEMENT ---
     current_state = AppState.IDLE
-    speech_rate = "+13.00%" 
+    speech_rate = "+11.50%" 
     dialogflow_session_path = ""
     audio_input_queue = None
     lesson_step = 0
