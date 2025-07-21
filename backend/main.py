@@ -148,28 +148,31 @@ quiz_questions = [
         "type": "multiple_choice",
         "text": "A family of 5 applies for a voucher. 4 members have eligible citizenship status, but one does not. What should the PHA do?",
         "options": ["A. Deny assistance to the entire family.", "B. Admit the family with a prorated assistance payment based on 4 out of 5 members being eligible.", "C. Tell the family to re-apply after the ineligible member leaves the household."],
-        "correct_answer": "B"
+        "correct_answer": "B",
+        "explanation": "This is a 'mixed family.' According to HUD rules, they are not denied but receive prorated assistance based on the number of eligible members."
     },
     {
         "type": "multiple_choice",
         "text": "Which of the following requires a PHA to mandatorily deny admission to an applicant family?",
         "options": ["A. A family member was evicted from a non-assisted apartment last year.", "B. A family member was convicted of manufacturing methamphetamine on the premises of federally-assisted housing.", "C. The family owes money to a previous landlord."],
-        "correct_answer": "B"
+        "correct_answer": "B",
+        "explanation": "The conviction for manufacturing methamphetamine on federally assisted housing property is one of the specific offenses that requires a mandatory, non-discretionary denial by the PHA."
     },
     {
         "type": "multiple_choice",
         "text": "The 'Income Targeting' rule states that at least 75% of new admissions to the HCV program must be families whose income is at or below the...",
         "options": ["A. Area Median Income limit.", "B. Low-Income limit.", "C. Extremely Low-Income (ELI) limit."],
-        "correct_answer": "C"
+        "correct_answer": "C",
+        "explanation": "The 75% income targeting rule is a key HUD requirement ensuring that PHAs prioritize serving the neediest families, who are categorized as Extremely Low-Income (ELI)."
     },
     {
         "type": "multiple_choice",
         "text": "What are the core principles a PHA must follow when determining eligibility?",
         "options": ["A. Speed and efficiency above all.", "B. The applicant's personal preferences.", "C. Objectivity, consistency, and compliance with all non-discrimination laws."],
-        "correct_answer": "C"
+        "correct_answer": "C",
+        "explanation": "The guidebook emphasizes that PHAs must act with objectivity and consistency, always providing families a chance to be heard while complying with all fair housing laws."
     }
 ]
-
 
 # --- LangChain Callback for Token Usage ---
 class UsageCallback(BaseCallbackHandler):
@@ -945,11 +948,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     answer = data.get("answer")
                     question_data = quiz_questions[quiz_step - 1]
                     is_correct = (answer == question_data['correct_answer'])
+                    explanation = question_data.get("explanation", "That's one of the key rules to remember.")
                     if is_correct:
                         quiz_score += 1 # Increment score on correct answer
                         feedback = "Correct!"
                     else:
-                        feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
+                        feedback = f"Not quite. The correct answer was {question_data['correct_answer']}. Because: {explanation}"
                     
                     await transition_to_state(AppState.QUIZ_FEEDBACK)
                     await websocket.send_json({"type": "ai_response", "text": feedback})
