@@ -62,110 +62,44 @@ class AppState(Enum):
 lesson_flow = [
     {
         "type": "lecture",
-        "text": "Welcome. This lesson covers the foundational rules for Eligibility Determination and Denial of Assistance for the Housing Choice Voucher program, based on the November 2019 guidebook. Our goal is to understand the core requirements set by HUD and how we, as a Public Housing Authority, must apply them."
+        "text": "Today, we're going to dive into one of the most fundamental aspects of our work: determining a family's eligibility for the Housing Choice Voucher, or HCV, program."
     },
     {
         "type": "lecture",
-        "text": "As outlined in the guidebook, PHAs must strive for objectivity and consistency when evaluating families for assistance. It is our responsibility to provide families with the opportunity to explain their circumstances, furnish additional information, and receive a clear explanation for any decision regarding their eligibility. Crucially, all our actions must comply with federal, state, and local non-discrimination laws and fair housing regulations."
-    },
-    {
-        "type": "lecture",
-        "text": "According to Section 2.1, there are four main factors we must consider when determining eligibility for the HCV program at admission. These are: the household meets HUD's definition of a 'family'; the household's annual income does not exceed the established income limits; the student status of the applicants meets specific criteria; and the applicant family has eligible citizenship or immigration status."
+        "text": "This session is based on the official Housing Choice Voucher Program Guidebook for Eligibility Determination and Denial of Assistance. Our goal today is to understand the core requirements set by HUD and how as a Public Housing Authority, or PHA, we apply them."
     },
     {
         "type": "question",
-        "text": "Before we dive in, can you recall one of those four main eligibility factors?",
-        "correct_answer": "Family Eligibility, Income Limits, Student Status, or Citizenship Status",
-        "feedback_correct": "Excellent! Yes, that's one of the core four.",
-        "feedback_incorrect": "Close. The four main factors are Family Eligibility, Income Limits, Student Status, and Citizenship Status."
+        "text": "What does PHA stand for?",
+        "correct_answer": "Public Housing Authority",
+        "feedback_correct": "That's right! Nicely done.",
+        "feedback_incorrect": "Not quite. PHA stands for Public Housing Authority. It's a key term we'll be using a lot."
     },
     {
         "type": "lecture",
-        "text": "Let's begin with Income Limits, a cornerstone of eligibility. As per Section 4 of the guidebook, a family’s annual income must not exceed the applicable income limit for their family size in our jurisdiction. Generally, to be eligible, a family must be either 'very low-income,' which is 50% of the area median income, or 'low-income,' which is 80% of the area median income, and meet additional criteria."
+        "text": "It's absolutely critical that we strive for objectivity and consistency in every single case. We must always give families the chance to explain their circumstances and understand the basis for our decisions."
     },
     {
         "type": "lecture",
-        "text": "A critical component of this is 'Income Targeting,' detailed in Section 4.1. Each PHA must ensure that 75 percent of its admissions in a fiscal year are families whose incomes are at or below the 'extremely low-income' or ELI limit. The ELI limit is defined as the higher of the federal poverty line or 30% of the area median income. This HUD requirement ensures we are prioritizing assistance to the neediest families in our community."
-    },
-    {
-        "type": "question",
-        "text": "What percentage of a PHA's new admissions each year must be for extremely low-income (ELI) families?",
-        "correct_answer": "75%",
-        "feedback_correct": "Correct! That 75% targeting rule is a key performance metric for PHAs.",
-        "feedback_incorrect": "Not quite. The correct answer is 75%. This is a crucial HUD requirement for serving the neediest families."
-    },
-    {
-        "type": "lecture",
-        "text": "Next, let's discuss Citizenship Status, covered in Section 7. Eligibility for federal housing assistance is limited to U.S. citizens and non-citizens who have an eligible immigration status. A family in which some members are eligible and some are not is called a 'mixed family.' These families may still be eligible for assistance."
-    },
-    {
-        "type": "lecture",
-        "text": "For a mixed family, we do not deny assistance outright. Instead, as described in section 7.3, we provide 'prorated assistance.' This means the housing assistance payment (HAP) is calculated based only on the number of eligible family members. For example, if a family of four has three eligible members, the proration percentage is 75%. If their full HAP would have been $300, they will receive a prorated HAP of $225. This ensures that the subsidy only benefits those who are eligible to receive it."
-    },
-    {
-        "type": "question",
-        "text": "True or False: A family with one ineligible member is automatically denied assistance.",
-        "correct_answer": "False",
-        "feedback_correct": "That's right, it's false. The family may be eligible for prorated assistance.",
-        "feedback_incorrect": "That's incorrect. A mixed-status family is not automatically denied. They may be eligible for prorated assistance based on the number of eligible members."
+        "text": "And above all, every action we take must comply with all federal, state, and local fair housing and non-discrimination laws."
     },
     {
         "type": "qna_prompt",
-        "text": "That covers income and citizenship. Do you have any questions before we move on to screening requirements?"
-    },
-    {
-        "type": "lecture",
-        "text": "Now, let's talk about screening requirements. In addition to the four main factors, PHAs must conduct screenings that can also result in denial of assistance. This includes verifying Social Security Numbers, checking for debts owed to other PHAs through the EIV system, and, critically, conducting criminal background screenings as detailed in Section 10."
-    },
-    {
-        "type": "lecture",
-        "text": "Section 10.1.4 outlines situations that require a MANDATORY denial of assistance. A PHA *must* deny admission if any member of the household is subject to a lifetime sex offender registration requirement in any state. Denial is also mandatory if any household member has been convicted of the manufacture of methamphetamine on the premises of federally assisted housing. For these specific offenses, the PHA has no discretion."
-    },
-    {
-        "type": "lecture",
-        "text": "However, PHAs can also establish additional local policies for DISCRETIONARY denials, covered in Section 10.2. These policies allow a PHA to deny applicants for reasons such as having been evicted from federally assisted housing within the past 5 years; committing fraud or bribery related to a housing program; or having engaged in threatening or violent behavior toward PHA personnel. These criteria must be clearly stated in the PHA's administrative plan and applied consistently."
-    },
-    {
-        "type": "question",
-        "text": "Which of these requires a MANDATORY denial of assistance?",
-        "correct_answer": "A household member being subject to a lifetime sex offender registration.",
-        "feedback_correct": "Correct. A lifetime sex offender registration requires a mandatory, non-discretionary denial of admission.",
-        "feedback_incorrect": "That's incorrect. While owing money to a PHA can be a reason for denial, it is discretionary. A lifetime sex offender registration requires a mandatory denial."
-    },
-    {
-        "type": "lecture",
-        "text": "Finally, Section 5 places specific restrictions on student eligibility. A student enrolled in an institution of higher education who does not live with their parents must meet additional eligibility criteria. These rules apply to both full-time and part-time students. To be eligible, the student must meet at least one condition, such as being 24 years of age or older, a veteran of the armed forces, married, having a dependent child, or being a person with disabilities, among other specific circumstances."
-    },
-    {
-        "type": "qna_prompt",
-        "text": "That concludes our detailed lesson on the key aspects of eligibility. Any final questions before the quiz?"
+        "text": "That's the end of this section. Do you have any questions before we continue?"
     }
 ]
 
-# The quiz_questions array remains unchanged as per your request
 quiz_questions = [
     {
         "type": "multiple_choice",
-        "text": "A family of 5 applies for a voucher. 4 members have eligible citizenship status, but one does not. What should the PHA do?",
-        "options": ["A. Deny assistance to the entire family.", "B. Admit the family with a prorated assistance payment based on 4 out of 5 members being eligible.", "C. Tell the family to re-apply after the ineligible member leaves the household."],
+        "text": "First question: What is the primary goal of the Housing Choice Voucher program?",
+        "options": ["A. To provide luxury housing", "B. To give families access to decent, safe, and sanitary housing", "C. To build new apartment complexes"],
         "correct_answer": "B"
     },
     {
         "type": "multiple_choice",
-        "text": "Which of the following requires a PHA to mandatorily deny admission to an applicant family?",
-        "options": ["A. A family member was evicted from a non-assisted apartment last year.", "B. A family member was convicted of manufacturing methamphetamine on the premises of federally-assisted housing.", "C. The family owes money to a previous landlord."],
-        "correct_answer": "B"
-    },
-    {
-        "type": "multiple_choice",
-        "text": "The 'Income Targeting' rule states that at least 75% of new admissions to the HCV program must be families whose income is at or below the...",
-        "options": ["A. Area Median Income limit.", "B. Low-Income limit.", "C. Extremely Low-Income (ELI) limit."],
-        "correct_answer": "C"
-    },
-    {
-        "type": "multiple_choice",
-        "text": "What are the core principles a PHA must follow when determining eligibility?",
-        "options": ["A. Speed and efficiency above all.", "B. The applicant's personal preferences.", "C. Objectivity, consistency, and compliance with all non-discrimination laws."],
+        "text": "Second question: What must a PHA comply with during eligibility determination?",
+        "options": ["A. Only federal housing laws", "B. The tenant's personal preferences", "C. All federal, state, and local fair housing and non-discrimination laws"],
         "correct_answer": "C"
     }
 ]
@@ -380,7 +314,7 @@ html = """
             z-index: 10; /* Ensure it's on top of the base image */
         }
 
-        #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); height: 550px; display: flex; flex-direction: column; }
+        #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); min-height: 400px; display: flex; flex-direction: column; }
         #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
         .user-message { background-color: #0084ff; color: white; margin-left: auto; }
@@ -857,8 +791,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             await advance_lesson()
                         # --- triggers the first quiz question ---
                         elif current_state == AppState.QUIZ_START:
-                            await advance_quiz()
-                        elif current_state == AppState.QUIZ_FEEDBACK:
                             await advance_quiz()
                 
                 # --- increments the score ---
