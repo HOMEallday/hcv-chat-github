@@ -734,10 +734,32 @@ class ConnectionManager:
             await self.send_ai_response(f"It's nice to meet you, {user_name}! Let's get started.", AppState.LESSON_PROLOGUE)
         elif self.current_state == AppState.LESSON_QUESTION:
             step_data = self.current_lesson_flow[self.lesson_step - 1]
-            feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
+            user_answer_lower = transcript.lower()
+            correct_answers = step_data['correct_answer'].split(',')
+            is_correct = any(answer.strip().lower() in user_answer_lower for answer in correct_answers)           
+            feedback = step_data['feedback_correct'] if is_correct else step_data['feedback_incorrect']
             await self.send_ai_response(feedback, AppState.LESSON_FEEDBACK)
+
         elif self.current_state in [AppState.LESSON_QNA, AppState.QNA]:
-            await self.send_ai_response("Thanks for the question! Let's move on.", AppState.QUIZ_START) 
+            dialogflow_result = await get_dialogflow_response(transcript, self.dialogflow_session_path)
+            intent_name = dialogflow_result.intent.display_name if dialogflow_result and hasattr(dialogflow_result, 'intent') else ""
+
+            # Scenario 1: User says "no"
+            if intent_name == 'DenyFollowup':
+                logger.info("User denied follow-up. Advancing lesson.")
+                await self.advance_lesson()
+
+            # Scenario 2: User says "yes" but doesn't ask the question
+            elif intent_name == 'ConfirmQuestion':
+                logger.info("User confirmed they have a question. Prompting for it.")
+                await self.send_ai_response("Great, what is your question?", AppState.QNA)
+
+            # Scenario 3: User asks the question directly (or says something else)
+            else:
+                logger.info("No clear intent matched. Assuming user is asking a question and falling back to RAG.")
+                rag_answer = await get_rag_response(transcript, self.dialogflow_session_path)
+                response_text = f"{rag_answer} Do you have any other questions?"
+                await self.send_ai_response(response_text, AppState.QNA)
 
     async def handle_text_message(self, data: dict):
         msg_type = data.get("type")
