@@ -486,7 +486,7 @@ html = """
         // --- NEW: Unified function to start any lesson ---
         async function startLesson(lessonId) {
             startupOverlay.style.display = 'none';
-            mainContent.style.display = 'flex'; // Show the main content area
+            mainContent.style.display = 'flex';
 
             if (!audioContext) {
                 try {
@@ -501,8 +501,17 @@ html = """
             // Connect and provide a callback function to select the lesson once connected
             connect(() => {
                 if (ws && ws.readyState === WebSocket.OPEN) {
-                    console.log(`Sending select_lesson command for lesson ID: ${lessonId}`);
-                    ws.send(JSON.stringify({ type: 'select_lesson', lesson_id: lessonId }));
+                    // Check localStorage for a saved user name
+                    const savedUserName = localStorage.getItem('userName');
+                    
+                    console.log(`Sending select_lesson for lesson ID: ${lessonId}. User name: ${savedUserName}`);
+                    
+                    // Send the name along with the lesson ID
+                    ws.send(JSON.stringify({
+                        type: 'select_lesson',
+                        lesson_id: lessonId,
+                        user_name: savedUserName 
+                    }));
                 }
             });
         }
@@ -592,6 +601,10 @@ html = """
             if (message.type === 'state_update') statusSpan.textContent = message.state;
             else if (message.type === 'ai_response') addMessage(message.text, 'ai');
             else if (message.type === 'user_transcript') addMessage(message.text, 'user');
+            else if (message.type === 'user_identity_set') {
+                console.log(`Received user name from backend: ${message.name}. Saving to localStorage.`);
+                localStorage.setItem('userName', message.name);
+            }
             else if (message.type === 'quiz_question') {
                 addMessage(message.text, 'ai');
                 displayQuizOptions(message.options);
@@ -673,6 +686,7 @@ class ConnectionManager:
         self.selected_lesson_id: Optional[str] = None
         self.current_lesson_flow: List[Dict] = []
         self.current_quiz_questions: List[Dict] = []
+        self.user_name: Optional[str] = None
 
     async def transition_to_state(self, new_state: AppState):
         self.current_state = new_state
@@ -715,25 +729,36 @@ class ConnectionManager:
         await self.websocket.send_json({"type": "user_transcript", "text": transcript})
         if self.current_state == AppState.INTRODUCTION:
             user_name = extract_name(transcript)
+            self.user_name = user_name
+            await self.websocket.send_json({"type": "user_identity_set", "name": self.user_name})
             await self.send_ai_response(f"It's nice to meet you, {user_name}! Let's get started.", AppState.LESSON_PROLOGUE)
         elif self.current_state == AppState.LESSON_QUESTION:
             step_data = self.current_lesson_flow[self.lesson_step - 1]
             feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
             await self.send_ai_response(feedback, AppState.LESSON_FEEDBACK)
         elif self.current_state in [AppState.LESSON_QNA, AppState.QNA]:
-            # Handle Q&A logic
-            await self.send_ai_response("Thanks for the question! Let's move on.", AppState.QUIZ_START) # Placeholder
+            await self.send_ai_response("Thanks for the question! Let's move on.", AppState.QUIZ_START) 
 
     async def handle_text_message(self, data: dict):
         msg_type = data.get("type")
         if msg_type == "select_lesson":
             lesson_id = data.get("lesson_id")
+            saved_user_name = data.get("user_name") 
             if lesson_id and lesson_id in lessons:
                 self.selected_lesson_id = lesson_id
                 self.current_lesson_flow = lessons[lesson_id]["flow"]
                 self.current_quiz_questions = lessons[lesson_id]["quiz"]
+                self.lesson_step = 0
+                self.quiz_step = 0
+                self.quiz_score = 0
                 logger.info(f"Client selected Lesson {lesson_id}: {lessons[lesson_id]['title']}")
-                await self.send_ai_response("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)
+
+                if saved_user_name:
+                    self.user_name = saved_user_name
+                    response_text = f"Welcome back, {self.user_name}! Let's begin Lesson {lesson_id}."
+                    await self.send_ai_response(response_text, AppState.LESSON_PROLOGUE)
+                else:
+                    await self.send_ai_response("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)
         elif msg_type == "set_speed":
             new_rate = data.get("rate")
             if new_rate:
@@ -918,23 +943,23 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
     await stt_thread
 
 async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, rate: str):
-    """
-    Generates TTS audio using a DYNAMIC speech rate provided as an argument.
-    """
     if not speech_config or not text:
         logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
         return
 
     escaped_text = text.replace("&", "&").replace("<", "<").replace(">", ">")
 
-    # --- MODIFIED: The 'rate' attribute now uses the function's 'rate' parameter ---
+    style = "cheerful"  # You can also try "empathetic" or "friendly"
+    #rate = "+7.50%"
     ssml_text = f"""
     <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
         <voice name="{speech_config.speech_synthesis_voice_name}">
-            <prosody rate="{rate}" pitch="-3%">
-                {escaped_text}
-                <mstts:silence type="Tailing" value="200ms"/>
-            </prosody>
+            <mstts:express-as style="{style}">
+                <prosody rate="{rate}" pitch="-3%">
+                    {escaped_text}
+                </prosody>
+            </mstts:express-as>
+            <mstts:silence type="Tailing" value="150ms"/>
         </voice>
     </speak>
     """
