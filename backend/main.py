@@ -83,8 +83,65 @@ lessons = {
                 "feedback_incorrect": "Close. The four main factors are Family Eligibility, Income Limits, Student Status, and Citizenship Status."
             },
             {
+                "type": "lecture",
+                "text": "Let's begin with Income Limits, a cornerstone of eligibility. As per Section 4 of the guidebook, a family’s annual income must not exceed the applicable income limit for their family size in our jurisdiction. Generally, to be eligible, a family must be either 'very low-income,' which is 50% of the area median income, or 'low-income,' which is 80% of the area median income, and meet additional criteria."
+            },
+            {
+                "type": "lecture",
+                "text": "A critical component of this is 'Income Targeting,' detailed in Section 4.1. Each PHA must ensure that 75 percent of its admissions in a fiscal year are families whose incomes are at or below the 'extremely low-income' or ELI limit. The ELI limit is defined as the higher of the federal poverty line or 30% of the area median income. This HUD requirement ensures we are prioritizing assistance to the neediest families in our community."
+            },
+            {
+                "type": "question",
+                "text": "What percentage of a PHA's new admissions each year must be for extremely low-income (ELI) families?",
+                "correct_answer": "75%",
+                "feedback_correct": "Correct! That 75% targeting rule is a key performance metric for PHAs.",
+                "feedback_incorrect": "Not quite. The correct answer is 75%. This is a crucial HUD requirement for serving the neediest families."
+            },
+            {
+                "type": "lecture",
+                "text": "Next, let's discuss Citizenship Status, covered in Section 7. Eligibility for federal housing assistance is limited to U.S. citizens and non-citizens who have an eligible immigration status. A family in which some members are eligible and some are not is called a 'mixed family.' These families may still be eligible for assistance."
+            },
+            {
+                "type": "lecture",
+                "text": "For a mixed family, we do not deny assistance outright. Instead, as described in section 7.3, we provide 'prorated assistance.' This means the housing assistance payment (HAP) is calculated based only on the number of eligible family members. For example, if a family of four has three eligible members, the proration percentage is 75%. If their full HAP would have been $300, they will receive a prorated HAP of $225. This ensures that the subsidy only benefits those who are eligible to receive it."
+            },
+            {
+                "type": "question",
+                "text": "True or False: A family with one ineligible member is automatically denied assistance.",
+                "correct_answer": "False",
+                "feedback_correct": "That's right, it's false. The family may be eligible for prorated assistance.",
+                "feedback_incorrect": "That's incorrect. A mixed-status family is not automatically denied. They may be eligible for prorated assistance based on the number of eligible members."
+            },
+            {
                 "type": "qna_prompt",
-                "text": "That covers the basics. Do you have any questions before we move on to the quiz?"
+                "text": "That covers income and citizenship. Do you have any questions before we move on to screening requirements?"
+            },
+            {
+                "type": "lecture",
+                "text": "Now, let's talk about screening requirements. In addition to the four main factors, PHAs must conduct screenings that can also result in denial of assistance. This includes verifying Social Security Numbers, checking for debts owed to other PHAs through the EIV system, and, critically, conducting criminal background screenings as detailed in Section 10."
+            },
+            {
+                "type": "lecture",
+                "text": "Section 10.1.4 outlines situations that require a MANDATORY denial of assistance. A PHA *must* deny admission if any member of the household is subject to a lifetime sex offender registration requirement in any state. Denial is also mandatory if any household member has been convicted of the manufacture of methamphetamine on the premises of federally assisted housing. For these specific offenses, the PHA has no discretion."
+            },
+            {
+                "type": "lecture",
+                "text": "However, PHAs can also establish additional local policies for DISCRETIONARY denials, covered in Section 10.2. These policies allow a PHA to deny applicants for reasons such as having been evicted from federally assisted housing within the past 5 years; committing fraud or bribery related to a housing program; or having engaged in threatening or violent behavior toward PHA personnel. These criteria must be clearly stated in the PHA's administrative plan and applied consistently."
+            },
+            {
+                "type": "question",
+                "text": "Which of these requires a MANDATORY denial of assistance?",
+                "correct_answer": "A household member being subject to a lifetime sex offender registration.",
+                "feedback_correct": "Correct. A lifetime sex offender registration requires a mandatory, non-discretionary denial of admission.",
+                "feedback_incorrect": "That's incorrect. While owing money to a PHA can be a reason for denial, it is discretionary. A lifetime sex offender registration requires a mandatory denial."
+            },
+            {
+                "type": "lecture",
+                "text": "Finally, Section 5 places specific restrictions on student eligibility. A student enrolled in an institution of higher education who does not live with their parents must meet additional eligibility criteria. These rules apply to both full-time and part-time students. To be eligible, the student must meet at least one condition, such as being 24 years of age or older, a veteran of the armed forces, married, having a dependent child, or being a person with disabilities, among other specific circumstances."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That concludes our detailed lesson on the key aspects of eligibility. Any final questions before the quiz?"
             }
         ],
         "quiz": [
@@ -92,23 +149,26 @@ lessons = {
                 "type": "multiple_choice",
                 "text": "A family of 5 applies for a voucher. 4 members have eligible citizenship status, but one does not. What should the PHA do?",
                 "options": ["A. Deny assistance to the entire family.", "B. Admit the family with a prorated assistance payment based on 4 out of 5 members being eligible.", "C. Tell the family to re-apply after the ineligible member leaves the household."],
-                "correct_answer": "B",
-                "explanation": "This is a 'mixed family.' According to HUD rules, they are not denied but receive prorated assistance based on the number of eligible members."
+                "correct_answer": "B"
             },
             {
                 "type": "multiple_choice",
                 "text": "Which of the following requires a PHA to mandatorily deny admission to an applicant family?",
                 "options": ["A. A family member was evicted from a non-assisted apartment last year.", "B. A family member was convicted of manufacturing methamphetamine on the premises of federally-assisted housing.", "C. The family owes money to a previous landlord."],
-                "correct_answer": "B",
-                "explanation": "The conviction for manufacturing methamphetamine on federally assisted housing property is one of the specific offenses that requires a mandatory, non-discretionary denial by the PHA."
+                "correct_answer": "B"
             },
             {
                 "type": "multiple_choice",
                 "text": "The 'Income Targeting' rule states that at least 75% of new admissions to the HCV program must be families whose income is at or below the...",
                 "options": ["A. Area Median Income limit.", "B. Low-Income limit.", "C. Extremely Low-Income (ELI) limit."],
-                "correct_answer": "C",
-                "explanation": "The 75% income targeting rule is a key HUD requirement ensuring that PHAs prioritize serving the neediest families, who are categorized as Extremely Low-Income (ELI)."
+                "correct_answer": "C"
             },
+            {
+                "type": "multiple_choice",
+                "text": "What are the core principles a PHA must follow when determining eligibility?",
+                "options": ["A. Speed and efficiency above all.", "B. The applicant's personal preferences.", "C. Objectivity, consistency, and compliance with all non-discrimination laws."],
+                "correct_answer": "C"
+            }
         ]
     },
     "2": {
@@ -674,6 +734,11 @@ class ConnectionManager:
                 self.current_quiz_questions = lessons[lesson_id]["quiz"]
                 logger.info(f"Client selected Lesson {lesson_id}: {lessons[lesson_id]['title']}")
                 await self.send_ai_response("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)
+        elif msg_type == "set_speed":
+            new_rate = data.get("rate")
+            if new_rate:
+                self.speech_rate = new_rate
+                logger.info(f"Client set speech rate to: {self.speech_rate}")
         elif msg_type == "control":
             command = data.get("command")
             if command == "start_speech":
@@ -686,6 +751,18 @@ class ConnectionManager:
                     async def result_handler():
                         transcript = await stt_results_queue.get()
                         if transcript: await self.handle_user_transcript(transcript)
+                        else: 
+                            logger.warning("No transcript received from STT.")
+                            current_s = self.current_state
+                            
+                            if current_s == AppState.LESSON_QNA:
+                                logger.info("User silent at Q&A prompt. Advancing lesson automatically.")
+                                await self.advance_lesson() 
+                            
+                            elif current_s in [AppState.INTRODUCTION, AppState.LESSON_QUESTION]:
+                                reprompt = "Sorry, I didn't get that. Could you please say it again?"
+                                await self.websocket.send_json({"type": "ai_response", "text": reprompt})
+                                await stream_azure_tts_and_send_to_client(reprompt, self.websocket, self.speech_rate)
                     asyncio.create_task(result_handler())
             elif command == "end_speech":
                 if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None
