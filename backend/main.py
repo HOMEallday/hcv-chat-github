@@ -192,6 +192,90 @@ lessons = {
                 "explanation": "This is just a placeholder to demonstrate the quiz functionality for a second lesson."
             }
         ]
+    },
+    "3": {
+        "title": "HCV Program Overview & Eligibility",
+        "flow": [
+            {
+                "type": "lecture",
+                "text": "At its core, the HCV Program aims to make housing more affordable for low-income families. Beyond this, it also seeks to promote freedom of housing choice, reduce poverty concentration, and support long-term self-sufficiency by providing stable housing."
+            },
+            {
+                "type": "lecture",
+                "text": "Several key players are involved. HUD allocates funds and sets regulations. The PHA administers the program locally, handling everything from eligibility to inspections. Participants must provide accurate information and follow program rules, while landlords agree to maintain their properties to Housing Quality Standards and accept housing assistance payments."
+            },
+            {
+                "type": "question",
+                "text": "Which entity is responsible for carrying out the program at the local level and issuing vouchers?",
+                "correct_answer": "PHA, or Public Housing Authority",
+                "feedback_correct": "That's exactly right! The PHA is the local administrator of the program.",
+                "feedback_incorrect": "Not quite. While HUD provides funding, it's the Public Housing Authority, or PHA, that manages the program on the local level."
+            },
+            {
+                "type": "lecture",
+                "text": "The program workflow is very structured. It begins with families applying and being placed on a waiting list. When their name is reached, the PHA determines their eligibility by verifying income and other factors."
+            },
+            {
+                "type": "lecture",
+                "text": "Once a family is found eligible, they are issued a voucher and must find a suitable housing unit. That unit must pass a Housing Quality Standards, or HQS, inspection. Only then can the PHA and landlord sign a Housing Assistance Payment, or HAP, contract, and the family can sign their lease."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That covers the key players and the basic workflow. Do you have any questions before we discuss program administration?"
+            },
+            {
+                "type": "lecture",
+                "text": "A critical part of administration is the HUD-50058 form. This document captures essential information about every participating family, including household composition, income, deductions, and rent calculations. PHAs must submit this form electronically for funding and compliance."
+            },
+            {
+                "type": "lecture",
+                "text": "Now, let's dive deeper into Eligibility and Admissions. PHAs may use local preferences to prioritize applicants on the waiting list, such as for veterans, the elderly, or disabled individuals. These preferences must be outlined in the PHA's Administrative Plan."
+            },
+            {
+                "type": "lecture",
+                "text": "Once selected, the PHA begins a detailed verification of the household's income, assets, and citizenship status. Documentation like pay stubs and birth certificates must be provided. PHAs are also required to use HUD’s Enterprise Income Verification, or EIV, system to validate reported income."
+            },
+            {
+                "type": "question",
+                "text": "True or False: A PHA must deny admission if any household member is subject to a lifetime sex offender registration requirement.",
+                "correct_answer": "True",
+                "feedback_correct": "Correct. This is a mandatory denial, and the PHA has no discretion in the matter.",
+                "feedback_incorrect": "That's incorrect. A lifetime sex offender registration is one of the few offenses that requires a mandatory, non-discretionary denial of assistance."
+            },
+            {
+                "type": "lecture",
+                "text": "Once a family is deemed fully eligible, the PHA briefs them on the program rules, issues their voucher, and provides instructions on how to find housing. This briefing is a critical step in preparing the family for success in the program."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That concludes our lesson on the HCV program workflow and eligibility. Do you have any final questions before the quiz?"
+            }
+        ],
+        "quiz": [
+            # You can add new quiz questions based on this content here
+            {
+                "type": "multiple_choice",
+                "text": "What is the primary purpose of the HUD-50058 form?",
+                "options": [
+                    "A. It's the family's application for the waiting list.",
+                    "B. It's the lease agreement between the tenant and landlord.",
+                    "C. It captures and reports essential family data for program administration and funding."
+                ],
+                "correct_answer": "C",
+                "explanation": "The HUD-50058 is the core administrative form used to report family information to HUD for compliance and funding."
+            },
+            {
+                "type": "multiple_choice",
+                "text": "Before a HAP contract can be signed, what must the family's chosen unit pass?",
+                "options": [
+                    "A. A credit check.",
+                    "B. A Housing Quality Standards (HQS) inspection.",
+                    "C. A review by the city council."
+                ],
+                "correct_answer": "B",
+                "explanation": "Every unit must pass an HQS inspection to ensure it is decent, safe, and sanitary before assistance can be paid on it."
+            }
+        ]
     }
 }
 
@@ -393,7 +477,7 @@ html = """
             <h2>HCV Training Program</h2>
             <button class="lesson-button" data-lesson-id="1">Lesson 1: Program Fundamentals</button>
             <button class="lesson-button" data-lesson-id="2">Lesson 2: Advanced Eligibility</button>
-            <button class="lesson-button" disabled>Lesson 3: Rent Calculation (Coming Soon...)</button>
+            <button class="lesson-button" data-lesson-id="3">Lesson 3: HCV Program Overview</button>
             <button class="lesson-button" disabled>Lesson 4: Inspections & Standards (Coming Soon...)</button>
         </div>
     </div>
@@ -757,7 +841,7 @@ class ConnectionManager:
             # Scenario 3: User asks the question directly (or says something else)
             else:
                 logger.info("No clear intent matched. Assuming user is asking a question and falling back to RAG.")
-                rag_answer = await get_rag_response(transcript, self.dialogflow_session_path)
+                rag_answer = await get_rag_response(transcript, dialogflow_result)
                 response_text = f"{rag_answer} Do you have any other questions?"
                 await self.send_ai_response(response_text, AppState.QNA)
 
@@ -918,11 +1002,10 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
             await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
             await transition_func(AppState.QNA)
 
-async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
+async def get_rag_response(transcript_text: str, dialogflow_response: Any) -> str:
     logger.info(f"Handling Q&A for: '{transcript_text}'")
     if not transcript_text.strip(): return "I didn't catch that. Please repeat."
 
-    dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
     if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
         return dialogflow_response.fulfillment_text
 
