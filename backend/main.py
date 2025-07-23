@@ -180,7 +180,7 @@ lessons = {
             },
             {
                 "type": "qna_prompt",
-                "text": "Would you like to try the placeholder quiz for lesson 2?"
+                "text": "Any Questions before moving to quiz?"
             }
         ],
         "quiz": [
@@ -772,6 +772,31 @@ class ConnectionManager:
         self.current_quiz_questions: List[Dict] = []
         self.user_name: Optional[str] = None
 
+    async def _get_dialogflow_response(self, transcript_text: str):
+        session_path = self.dialogflow_session_path
+        text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
+        query_input = dialogflow.QueryInput(text=text_input)
+        try:
+            response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
+            return response.query_result
+        except GoogleAPIError as e:
+            logger.error(f"Dialogflow API error: {e}")
+            return f"Dialogflow Error: {e}"
+
+    async def _get_rag_response(self, transcript_text: str, dialogflow_response: Any) -> str:
+        logger.info(f"Handling Q&A for: '{transcript_text}'")
+        if not transcript_text.strip(): return "I didn't catch that. Please repeat."
+
+        if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
+            return dialogflow_response.fulfillment_text
+
+        if not retrieval_chain: return "My document search system isn't configured."
+        logger.info("Falling back to RAG system.")
+        usage_callback = UsageCallback()
+        rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
+        log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
+        return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
+
     async def transition_to_state(self, new_state: AppState):
         self.current_state = new_state
         logger.info(f"Transitioning to state: {self.current_state.value}")
@@ -824,24 +849,22 @@ class ConnectionManager:
             feedback = step_data['feedback_correct'] if is_correct else step_data['feedback_incorrect']
             await self.send_ai_response(feedback, AppState.LESSON_FEEDBACK)
 
-        elif self.current_state in [AppState.LESSON_QNA, AppState.QNA]:
-            dialogflow_result = await get_dialogflow_response(transcript, self.dialogflow_session_path)
+        elif self.current_state in [AppState.LESSON_QNA, AppState.QNA]: #maybe add Quiz_complete here too
+            dialogflow_result = await self._get_dialogflow_response(transcript)
             intent_name = dialogflow_result.intent.display_name if dialogflow_result and hasattr(dialogflow_result, 'intent') else ""
 
-            # Scenario 1: User says "no"
             if intent_name == 'DenyFollowup':
+                response_text = "Sounds good! Let's get started with the quiz."
                 logger.info("User denied follow-up. Advancing lesson.")
                 await self.advance_lesson()
 
-            # Scenario 2: User says "yes" but doesn't ask the question
             elif intent_name == 'ConfirmQuestion':
                 logger.info("User confirmed they have a question. Prompting for it.")
                 await self.send_ai_response("Great, what is your question?", AppState.QNA)
 
-            # Scenario 3: User asks the question directly (or says something else)
             else:
                 logger.info("No clear intent matched. Assuming user is asking a question and falling back to RAG.")
-                rag_answer = await get_rag_response(transcript, dialogflow_result)
+                rag_answer = await self._get_rag_response(transcript, dialogflow_result)
                 response_text = f"{rag_answer} Do you have any other questions?"
                 await self.send_ai_response(response_text, AppState.QNA)
 
@@ -881,7 +904,8 @@ class ConnectionManager:
                     asyncio.create_task(transcribe_speech(self.audio_input_queue, stt_results_queue))
                     async def result_handler():
                         transcript = await stt_results_queue.get()
-                        if transcript: await self.handle_user_transcript(transcript)
+                        if transcript:
+                            await self.handle_user_transcript(transcript)
                         else: 
                             logger.warning("No transcript received from STT.")
                             current_s = self.current_state
@@ -954,67 +978,6 @@ def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_nam
     cost = ((prompt_tokens / 1000) * PRICING[model_name]["prompt"]) + ((completion_tokens / 1000) * PRICING[model_name]["completion"]) if model_name in PRICING else 0
     logger.info(f"--- RAG Cost --- Tokens: {prompt_tokens}p + {completion_tokens}c = {prompt_tokens + completion_tokens}t | Est. Cost: ${cost:.6f}")
 
-async def get_dialogflow_response(transcript_text: str, session_path: str):
-    text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
-    query_input = dialogflow.QueryInput(text=text_input)
-    try:
-        response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
-        return response.query_result
-    except GoogleAPIError as e:
-        logger.error(f"Dialogflow API error: {e}")
-        return f"Dialogflow Error: {e}"
-
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, speech_rate: str, lesson_flow_content: list):
-    await websocket.send_json({"type": "user_transcript", "text": transcript})
-
-    if current_state == AppState.INTRODUCTION:
-        user_name = extract_name(transcript)
-        response_text = f"It's nice to meet you, {user_name}! Let's get started."
-        await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-        await transition_func(AppState.LESSON_PROLOGUE)
-
-    elif current_state == AppState.LESSON_QUESTION:
-        step_data = lesson_flow_content[lesson_step - 1]
-        feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
-        await transition_func(AppState.LESSON_FEEDBACK)
-        await websocket.send_json({"type": "ai_response", "text": feedback})
-        await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
-
-    elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
-        dialogflow_result = await get_dialogflow_response(transcript, session_path)
-        intent_name = dialogflow_result.intent.display_name if dialogflow_result else ""
-
-        if intent_name == 'DenyFollowup':
-            response_text = "Sounds good! Let's get started with the quiz."
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            await transition_func(AppState.QUIZ_START)
-        elif intent_name == 'ConfirmQuestion':
-            response_text = "Great, what is your question?"
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            await transition_func(AppState.QNA)
-        else:
-            rag_answer = await get_rag_response(transcript, session_path)
-            response_text = f"{rag_answer} Do you have any other questions?"
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            await transition_func(AppState.QNA)
-
-async def get_rag_response(transcript_text: str, dialogflow_response: Any) -> str:
-    logger.info(f"Handling Q&A for: '{transcript_text}'")
-    if not transcript_text.strip(): return "I didn't catch that. Please repeat."
-
-    if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
-        return dialogflow_response.fulfillment_text
-
-    if not retrieval_chain: return "My document search system isn't configured."
-    logger.info("Falling back to RAG system.")
-    usage_callback = UsageCallback()
-    rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
-    log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
-    return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
 
 async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
     sync_bridge_queue = queue.Queue()
