@@ -5,6 +5,7 @@ import logging
 import queue
 import re
 import time
+import random
 from contextlib import asynccontextmanager
 from enum import Enum, auto
 from typing import Dict, List, Optional, Any
@@ -28,8 +29,10 @@ from pydantic import BaseModel
 import vertexai
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
-
+from vertexai.generative_models import GenerativeModel
 from config import settings
+import langchain
+langchain.debug = True
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -37,10 +40,8 @@ logger = logging.getLogger(__name__)
 
 # --- Global Variables ---
 speech_client = None
-tts_client = None
+speech_config = None
 dialogflow_sessions_client = None
-retrieval_chain = None
-gemini_llm: Optional[ChatVertexAI] = None
 
 # --- Application State Enum ---
 class AppState(Enum):
@@ -59,120 +60,225 @@ class AppState(Enum):
 
 
 # --- Lesson & Quiz Content ---
-lesson_flow = [
-    {
-        "type": "lecture",
-        "text": "Welcome. This lesson covers the foundational rules for Eligibility Determination and Denial of Assistance for the Housing Choice Voucher program, based on the November 2019 guidebook. Our goal is to understand the core requirements set by HUD and how we, as a Public Housing Authority, must apply them."
+lessons = {
+    "1": {
+        "title": "Program Fundamentals",
+        "flow": [
+            {
+                "type": "lecture",
+                "text": "Welcome. This lesson covers the foundational rules for Eligibility Determination and Denial of Assistance for the Housing Choice Voucher program, based on the November 2019 guidebook. Our goal is to understand the core requirements set by HUD and how we, as a Public Housing Authority, must apply them."
+            },
+            {
+                "type": "lecture",
+                "text": "As outlined in the guidebook, PHAs must strive for objectivity and consistency when evaluating families for assistance. It is our responsibility to provide families with the opportunity to explain their circumstances, furnish additional information, and receive a clear explanation for any decision regarding their eligibility. Crucially, all our actions must comply with federal, state, and local non-discrimination laws and fair housing regulations."
+            },
+            {
+                "type": "lecture",
+                "text": "According to Section 2.1, there are four main factors we must consider when determining eligibility for the HCV program at admission. These are: the household meets HUD's definition of a 'family'; the household's annual income does not exceed the established income limits; the student status of the applicants meets specific criteria; and the applicant family has eligible citizenship or immigration status."
+            },
+            {
+                "type": "question",
+                "text": "Before we dive in, can you recall one of those four main eligibility factors?",
+                "correct_answer": "Family Eligibility, Income Limits, Student Status, or Citizenship Status",
+                "feedback_correct": "Excellent! Yes, that's one of the core four.",
+                "feedback_incorrect": "Close. The four main factors are Family Eligibility, Income Limits, Student Status, and Citizenship Status."
+            },
+            {
+                "type": "lecture",
+                "text": "Let's begin with Income Limits, a cornerstone of eligibility. As per Section 4 of the guidebook, a family’s annual income must not exceed the applicable income limit for their family size in our jurisdiction. Generally, to be eligible, a family must be either 'very low-income,' which is 50% of the area median income, or 'low-income,' which is 80% of the area median income, and meet additional criteria."
+            },
+            {
+                "type": "lecture",
+                "text": "A critical component of this is 'Income Targeting,' detailed in Section 4.1. Each PHA must ensure that 75 percent of its admissions in a fiscal year are families whose incomes are at or below the 'extremely low-income' or ELI limit. The ELI limit is defined as the higher of the federal poverty line or 30% of the area median income. This HUD requirement ensures we are prioritizing assistance to the neediest families in our community."
+            },
+            {
+                "type": "question",
+                "text": "What percentage of a PHA's new admissions each year must be for extremely low-income (ELI) families?",
+                "correct_answer": "75%",
+                "feedback_correct": "Correct! That 75% targeting rule is a key performance metric for PHAs.",
+                "feedback_incorrect": "Not quite. The correct answer is 75%. This is a crucial HUD requirement for serving the neediest families."
+            },
+            {
+                "type": "lecture",
+                "text": "Next, let's discuss Citizenship Status, covered in Section 7. Eligibility for federal housing assistance is limited to U.S. citizens and non-citizens who have an eligible immigration status. A family in which some members are eligible and some are not is called a 'mixed family.' These families may still be eligible for assistance."
+            },
+            {
+                "type": "lecture",
+                "text": "For a mixed family, we do not deny assistance outright. Instead, as described in section 7.3, we provide 'prorated assistance.' This means the housing assistance payment (HAP) is calculated based only on the number of eligible family members. For example, if a family of four has three eligible members, the proration percentage is 75%. If their full HAP would have been $300, they will receive a prorated HAP of $225. This ensures that the subsidy only benefits those who are eligible to receive it."
+            },
+            {
+                "type": "question",
+                "text": "True or False: A family with one ineligible member is automatically denied assistance.",
+                "correct_answer": "False",
+                "feedback_correct": "That's right, it's false. The family may be eligible for prorated assistance.",
+                "feedback_incorrect": "That's incorrect. A mixed-status family is not automatically denied. They may be eligible for prorated assistance based on the number of eligible members."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That covers income and citizenship. Do you have any questions before we move on to screening requirements?"
+            },
+            {
+                "type": "lecture",
+                "text": "Now, let's talk about screening requirements. In addition to the four main factors, PHAs must conduct screenings that can also result in denial of assistance. This includes verifying Social Security Numbers, checking for debts owed to other PHAs through the EIV system, and, critically, conducting criminal background screenings as detailed in Section 10."
+            },
+            {
+                "type": "lecture",
+                "text": "Section 10.1.4 outlines situations that require a MANDATORY denial of assistance. A PHA *must* deny admission if any member of the household is subject to a lifetime sex offender registration requirement in any state. Denial is also mandatory if any household member has been convicted of the manufacture of methamphetamine on the premises of federally assisted housing. For these specific offenses, the PHA has no discretion."
+            },
+            {
+                "type": "lecture",
+                "text": "However, PHAs can also establish additional local policies for DISCRETIONARY denials, covered in Section 10.2. These policies allow a PHA to deny applicants for reasons such as having been evicted from federally assisted housing within the past 5 years; committing fraud or bribery related to a housing program; or having engaged in threatening or violent behavior toward PHA personnel. These criteria must be clearly stated in the PHA's administrative plan and applied consistently."
+            },
+            {
+                "type": "question",
+                "text": "Which of these requires a MANDATORY denial of assistance?",
+                "correct_answer": "A household member being subject to a lifetime sex offender registration.",
+                "feedback_correct": "Correct. A lifetime sex offender registration requires a mandatory, non-discretionary denial of admission.",
+                "feedback_incorrect": "That's incorrect. While owing money to a PHA can be a reason for denial, it is discretionary. A lifetime sex offender registration requires a mandatory denial."
+            },
+            {
+                "type": "lecture",
+                "text": "Finally, Section 5 places specific restrictions on student eligibility. A student enrolled in an institution of higher education who does not live with their parents must meet additional eligibility criteria. These rules apply to both full-time and part-time students. To be eligible, the student must meet at least one condition, such as being 24 years of age or older, a veteran of the armed forces, married, having a dependent child, or being a person with disabilities, among other specific circumstances."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That concludes our detailed lesson on the key aspects of eligibility. Any final questions before the quiz?"
+            }
+        ],
+        "quiz": [
+            {
+                "type": "multiple_choice",
+                "text": "A family of 5 applies for a voucher. 4 members have eligible citizenship status, but one does not. What should the PHA do?",
+                "options": ["A. Deny assistance to the entire family.", "B. Admit the family with a prorated assistance payment based on 4 out of 5 members being eligible.", "C. Tell the family to re-apply after the ineligible member leaves the household."],
+                "correct_answer": "B"
+            },
+            {
+                "type": "multiple_choice",
+                "text": "Which of the following requires a PHA to mandatorily deny admission to an applicant family?",
+                "options": ["A. A family member was evicted from a non-assisted apartment last year.", "B. A family member was convicted of manufacturing methamphetamine on the premises of federally-assisted housing.", "C. The family owes money to a previous landlord."],
+                "correct_answer": "B"
+            },
+            {
+                "type": "multiple_choice",
+                "text": "The 'Income Targeting' rule states that at least 75% of new admissions to the HCV program must be families whose income is at or below the...",
+                "options": ["A. Area Median Income limit.", "B. Low-Income limit.", "C. Extremely Low-Income (ELI) limit."],
+                "correct_answer": "C"
+            },
+            {
+                "type": "multiple_choice",
+                "text": "What are the core principles a PHA must follow when determining eligibility?",
+                "options": ["A. Speed and efficiency above all.", "B. The applicant's personal preferences.", "C. Objectivity, consistency, and compliance with all non-discrimination laws."],
+                "correct_answer": "C"
+            }
+        ]
     },
-    {
-        "type": "lecture",
-        "text": "As outlined in the guidebook, PHAs must strive for objectivity and consistency when evaluating families for assistance. It is our responsibility to provide families with the opportunity to explain their circumstances, furnish additional information, and receive a clear explanation for any decision regarding their eligibility. Crucially, all our actions must comply with federal, state, and local non-discrimination laws and fair housing regulations."
+    "2": {
+        "title": "Advanced Eligibility (Coming Soon...)",
+        "flow": [
+            {
+                "type": "lecture",
+                "text": "lesson is currently under development."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "Any Questions before moving to quiz?"
+            }
+        ],
+        "quiz": [
+            {
+                "type": "multiple_choice",
+                "text": "This is a placeholder question for Lesson 2. What is the correct answer?",
+                "options": ["A. This one.", "B. Not this one.", "C. Maybe this one."],
+                "correct_answer": "A",
+                "explanation": "This is just a placeholder to demonstrate the quiz functionality for a second lesson."
+            }
+        ]
     },
-    {
-        "type": "lecture",
-        "text": "According to Section 2.1, there are four main factors we must consider when determining eligibility for the HCV program at admission. These are: the household meets HUD's definition of a 'family'; the household's annual income does not exceed the established income limits; the student status of the applicants meets specific criteria; and the applicant family has eligible citizenship or immigration status."
-    },
-    {
-        "type": "question",
-        "text": "Before we dive in, can you recall one of those four main eligibility factors?",
-        "correct_answer": "Family Eligibility, Income Limits, Student Status, or Citizenship Status",
-        "feedback_correct": "Excellent! Yes, that's one of the core four.",
-        "feedback_incorrect": "Close. The four main factors are Family Eligibility, Income Limits, Student Status, and Citizenship Status."
-    },
-    {
-        "type": "lecture",
-        "text": "Let's begin with Income Limits, a cornerstone of eligibility. As per Section 4 of the guidebook, a family’s annual income must not exceed the applicable income limit for their family size in our jurisdiction. Generally, to be eligible, a family must be either 'very low-income,' which is 50% of the area median income, or 'low-income,' which is 80% of the area median income, and meet additional criteria."
-    },
-    {
-        "type": "lecture",
-        "text": "A critical component of this is 'Income Targeting,' detailed in Section 4.1. Each PHA must ensure that 75 percent of its admissions in a fiscal year are families whose incomes are at or below the 'extremely low-income' or ELI limit. The ELI limit is defined as the higher of the federal poverty line or 30% of the area median income. This HUD requirement ensures we are prioritizing assistance to the neediest families in our community."
-    },
-    {
-        "type": "question",
-        "text": "What percentage of a PHA's new admissions each year must be for extremely low-income (ELI) families?",
-        "correct_answer": "75%",
-        "feedback_correct": "Correct! That 75% targeting rule is a key performance metric for PHAs.",
-        "feedback_incorrect": "Not quite. The correct answer is 75%. This is a crucial HUD requirement for serving the neediest families."
-    },
-    {
-        "type": "lecture",
-        "text": "Next, let's discuss Citizenship Status, covered in Section 7. Eligibility for federal housing assistance is limited to U.S. citizens and non-citizens who have an eligible immigration status. A family in which some members are eligible and some are not is called a 'mixed family.' These families may still be eligible for assistance."
-    },
-    {
-        "type": "lecture",
-        "text": "For a mixed family, we do not deny assistance outright. Instead, as described in section 7.3, we provide 'prorated assistance.' This means the housing assistance payment (HAP) is calculated based only on the number of eligible family members. For example, if a family of four has three eligible members, the proration percentage is 75%. If their full HAP would have been $300, they will receive a prorated HAP of $225. This ensures that the subsidy only benefits those who are eligible to receive it."
-    },
-    {
-        "type": "question",
-        "text": "True or False: A family with one ineligible member is automatically denied assistance.",
-        "correct_answer": "False",
-        "feedback_correct": "That's right, it's false. The family may be eligible for prorated assistance.",
-        "feedback_incorrect": "That's incorrect. A mixed-status family is not automatically denied. They may be eligible for prorated assistance based on the number of eligible members."
-    },
-    {
-        "type": "qna_prompt",
-        "text": "That covers income and citizenship. Do you have any questions before we move on to screening requirements?"
-    },
-    {
-        "type": "lecture",
-        "text": "Now, let's talk about screening requirements. In addition to the four main factors, PHAs must conduct screenings that can also result in denial of assistance. This includes verifying Social Security Numbers, checking for debts owed to other PHAs through the EIV system, and, critically, conducting criminal background screenings as detailed in Section 10."
-    },
-    {
-        "type": "lecture",
-        "text": "Section 10.1.4 outlines situations that require a MANDATORY denial of assistance. A PHA *must* deny admission if any member of the household is subject to a lifetime sex offender registration requirement in any state. Denial is also mandatory if any household member has been convicted of the manufacture of methamphetamine on the premises of federally assisted housing. For these specific offenses, the PHA has no discretion."
-    },
-    {
-        "type": "lecture",
-        "text": "However, PHAs can also establish additional local policies for DISCRETIONARY denials, covered in Section 10.2. These policies allow a PHA to deny applicants for reasons such as having been evicted from federally assisted housing within the past 5 years; committing fraud or bribery related to a housing program; or having engaged in threatening or violent behavior toward PHA personnel. These criteria must be clearly stated in the PHA's administrative plan and applied consistently."
-    },
-    {
-        "type": "question",
-        "text": "Which of these requires a MANDATORY denial of assistance?",
-        "correct_answer": "A household member being subject to a lifetime sex offender registration.",
-        "feedback_correct": "Correct. A lifetime sex offender registration requires a mandatory, non-discretionary denial of admission.",
-        "feedback_incorrect": "That's incorrect. While owing money to a PHA can be a reason for denial, it is discretionary. A lifetime sex offender registration requires a mandatory denial."
-    },
-    {
-        "type": "lecture",
-        "text": "Finally, Section 5 places specific restrictions on student eligibility. A student enrolled in an institution of higher education who does not live with their parents must meet additional eligibility criteria. These rules apply to both full-time and part-time students. To be eligible, the student must meet at least one condition, such as being 24 years of age or older, a veteran of the armed forces, married, having a dependent child, or being a person with disabilities, among other specific circumstances."
-    },
-    {
-        "type": "qna_prompt",
-        "text": "That concludes our detailed lesson on the key aspects of eligibility. Any final questions before the quiz?"
+    "3": {
+        "title": "HCV Program Overview & Eligibility",
+        "flow": [
+            {
+                "type": "lecture",
+                "text": "At its core, the HCV Program aims to make housing more affordable for low-income families. Beyond this, it also seeks to promote freedom of housing choice, reduce poverty concentration, and support long-term self-sufficiency by providing stable housing."
+            },
+            {
+                "type": "lecture",
+                "text": "Several key players are involved. HUD allocates funds and sets regulations. The PHA administers the program locally, handling everything from eligibility to inspections. Participants must provide accurate information and follow program rules, while landlords agree to maintain their properties to Housing Quality Standards and accept housing assistance payments."
+            },
+            {
+                "type": "question",
+                "text": "Which entity is responsible for carrying out the program at the local level and issuing vouchers?",
+                "correct_answer": "PHA, or Public Housing Authority",
+                "feedback_correct": "That's exactly right! The PHA is the local administrator of the program.",
+                "feedback_incorrect": "Not quite. While HUD provides funding, it's the Public Housing Authority, or PHA, that manages the program on the local level."
+            },
+            {
+                "type": "lecture",
+                "text": "The program workflow is very structured. It begins with families applying and being placed on a waiting list. When their name is reached, the PHA determines their eligibility by verifying income and other factors."
+            },
+            {
+                "type": "lecture",
+                "text": "Once a family is found eligible, they are issued a voucher and must find a suitable housing unit. That unit must pass a Housing Quality Standards, or HQS, inspection. Only then can the PHA and landlord sign a Housing Assistance Payment, or HAP, contract, and the family can sign their lease."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That covers the key players and the basic workflow. Do you have any questions before we discuss program administration?"
+            },
+            {
+                "type": "lecture",
+                "text": "A critical part of administration is the HUD-50058 form. This document captures essential information about every participating family, including household composition, income, deductions, and rent calculations. PHAs must submit this form electronically for funding and compliance."
+            },
+            {
+                "type": "lecture",
+                "text": "Now, let's dive deeper into Eligibility and Admissions. PHAs may use local preferences to prioritize applicants on the waiting list, such as for veterans, the elderly, or disabled individuals. These preferences must be outlined in the PHA's Administrative Plan."
+            },
+            {
+                "type": "lecture",
+                "text": "Once selected, the PHA begins a detailed verification of the household's income, assets, and citizenship status. Documentation like pay stubs and birth certificates must be provided. PHAs are also required to use HUD’s Enterprise Income Verification, or EIV, system to validate reported income."
+            },
+            {
+                "type": "question",
+                "text": "True or False: A PHA must deny admission if any household member is subject to a lifetime sex offender registration requirement.",
+                "correct_answer": "True",
+                "feedback_correct": "Correct. This is a mandatory denial, and the PHA has no discretion in the matter.",
+                "feedback_incorrect": "That's incorrect. A lifetime sex offender registration is one of the few offenses that requires a mandatory, non-discretionary denial of assistance."
+            },
+            {
+                "type": "lecture",
+                "text": "Once a family is deemed fully eligible, the PHA briefs them on the program rules, issues their voucher, and provides instructions on how to find housing. This briefing is a critical step in preparing the family for success in the program."
+            },
+            {
+                "type": "qna_prompt",
+                "text": "That concludes our lesson on the HCV program workflow and eligibility. Do you have any final questions before the quiz?"
+            }
+        ],
+        "quiz": [
+            # You can add new quiz questions based on this content here
+            {
+                "type": "multiple_choice",
+                "text": "What is the primary purpose of the HUD-50058 form?",
+                "options": [
+                    "A. It's the family's application for the waiting list.",
+                    "B. It's the lease agreement between the tenant and landlord.",
+                    "C. It captures and reports essential family data for program administration and funding."
+                ],
+                "correct_answer": "C",
+                "explanation": "The HUD-50058 is the core administrative form used to report family information to HUD for compliance and funding."
+            },
+            {
+                "type": "multiple_choice",
+                "text": "Before a HAP contract can be signed, what must the family's chosen unit pass?",
+                "options": [
+                    "A. A credit check.",
+                    "B. A Housing Quality Standards (HQS) inspection.",
+                    "C. A review by the city council."
+                ],
+                "correct_answer": "B",
+                "explanation": "Every unit must pass an HQS inspection to ensure it is decent, safe, and sanitary before assistance can be paid on it."
+            }
+        ]
     }
-]
-
-# The quiz_questions array remains unchanged as per your request
-quiz_questions = [
-    {
-        "type": "multiple_choice",
-        "text": "A family of 5 applies for a voucher. 4 members have eligible citizenship status, but one does not. What should the PHA do?",
-        "options": ["A. Deny assistance to the entire family.", "B. Admit the family with a prorated assistance payment based on 4 out of 5 members being eligible.", "C. Tell the family to re-apply after the ineligible member leaves the household."],
-        "correct_answer": "B",
-        "explanation": "This is a 'mixed family.' According to HUD rules, they are not denied but receive prorated assistance based on the number of eligible members."
-    },
-    {
-        "type": "multiple_choice",
-        "text": "Which of the following requires a PHA to mandatorily deny admission to an applicant family?",
-        "options": ["A. A family member was evicted from a non-assisted apartment last year.", "B. A family member was convicted of manufacturing methamphetamine on the premises of federally-assisted housing.", "C. The family owes money to a previous landlord."],
-        "correct_answer": "B",
-        "explanation": "The conviction for manufacturing methamphetamine on federally assisted housing property is one of the specific offenses that requires a mandatory, non-discretionary denial by the PHA."
-    },
-    {
-        "type": "multiple_choice",
-        "text": "The 'Income Targeting' rule states that at least 75% of new admissions to the HCV program must be families whose income is at or below the...",
-        "options": ["A. Area Median Income limit.", "B. Low-Income limit.", "C. Extremely Low-Income (ELI) limit."],
-        "correct_answer": "C",
-        "explanation": "The 75% income targeting rule is a key HUD requirement ensuring that PHAs prioritize serving the neediest families, who are categorized as Extremely Low-Income (ELI)."
-    },
-    {
-        "type": "multiple_choice",
-        "text": "What are the core principles a PHA must follow when determining eligibility?",
-        "options": ["A. Speed and efficiency above all.", "B. The applicant's personal preferences.", "C. Objectivity, consistency, and compliance with all non-discrimination laws."],
-        "correct_answer": "C",
-        "explanation": "The guidebook emphasizes that PHAs must act with objectivity and consistency, always providing families a chance to be heard while complying with all fair housing laws."
-    }
-]
+}
 
 # --- LangChain Callback for Token Usage ---
 class UsageCallback(BaseCallbackHandler):
@@ -183,73 +289,54 @@ class UsageCallback(BaseCallbackHandler):
 
     def on_llm_end(self, response, **kwargs):
         try:
-            if response.generations and response.generations[0]:
-                generation_info = response.generations[0][0].generation_info
-                if generation_info:
-                    usage_metadata = generation_info.get("usage_metadata", {})
-                    self.prompt_tokens = usage_metadata.get("prompt_token_count", 0)
-                    self.completion_tokens = usage_metadata.get("candidates_token_count", 0)
-        except (KeyError, IndexError, AttributeError) as e:
-            logger.warning(f"Could not extract token usage from response: {e}")
+            usage_metadata = response.generations[0][0].generation_info.get("usage_metadata", {})
+            self.prompt_tokens = usage_metadata.get("prompt_token_count", 0)
+            self.completion_tokens = usage_metadata.get("candidates_token_count", 0)
+        except (KeyError, IndexError, AttributeError, TypeError):
+            logger.warning("Could not extract token usage from response.")
 
 # --- FastAPI Lifespan Manager (for startup and shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global speech_client, speech_config, dialogflow_sessions_client, retrieval_chain, gemini_llm # --- MODIFIED ---
+    global speech_client, speech_config, dialogflow_sessions_client
     logger.info("--- Application Startup Initiated ---")
     try:
         # Initialize clients
         speech_client = speech.SpeechClient()
         dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
         vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID)
-
         logger.info(f"Google clients initialized successfully for project: {settings.GOOGLE_CLOUD_PROJECT_ID}")
 
+        # Configure Azure Speech
         try:
             speech_config = speechsdk.SpeechConfig(
-                subscription=settings.AZURE_SPEECH_KEY, 
-                region=settings.AZURE_SPEECH_REGION
+                subscription=settings.AZURE_SPEECH_KEY, region=settings.AZURE_SPEECH_REGION
             )
-
             speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
-            # Set the output format. MP3 is widely compatible.
             speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
             logger.info("Azure Speech Service configured successfully.")
         except Exception as e:
             logger.error(f"!!! FAILED to configure Azure Speech Service: {e} !!!")
             speech_config = None
 
-        gemini_llm = ChatVertexAI(
-            model_name="gemini-2.5-flash",
-            temperature=0.2,
-        )
-        embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
+        # --- CORRECTED RAG SETUP ---
+        # 1. Initialize LLM and Embeddings
+        llm = GenerativeModel("gemini-2.5-flash")
+        embeddings = VertexAIEmbeddings(model_name="text-embedding-005") # Using a recent, stable version
 
-        # Load ChromaDB
-        chroma_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'chroma_db')
+        # 2. Set default states
+        app.state.retriever = None
+        app.state.llm = llm
+
+        # 3. Load ChromaDB and create the retriever
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        chroma_db_path = os.path.join(base_dir, '..', 'data', 'chroma_db')
+        
         if os.path.exists(chroma_db_path):
             vectorstore = Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
-
-            # Build RAG chain
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
-            rag_prompt = ChatPromptTemplate.from_template("""
-You are an AI assistant for housing policies. Provide EXTREMELY concise, one-paragraph summaries.
-CRITICAL INSTRUCTIONS:
-- Your response MUST be a single, short paragraph.
-- You MUST NOT use any markdown formatting.
-- If the context does not contain the answer, ONLY say "I don't have enough information to answer that."
-- Get straight to the point.
-
-CONTEXT:
-{context}
-
-QUESTION:
-{input}
-""")
-
-            document_chain = create_stuff_documents_chain(gemini_llm, rag_prompt)
-            retrieval_chain = create_retrieval_chain(retriever, document_chain)
-            logger.info(">>> RAG chain built successfully.")
+            # 4. Correctly store the retriever in the app's state
+            app.state.retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+            logger.info(">>> Retriever and LLM initialized successfully.")
         else:
             logger.error(f"Chroma DB not found at {chroma_db_path}. RAG will be unavailable.")
 
@@ -332,57 +419,28 @@ html = """
             display: flex;
             flex-direction: column;
             height: 100vh;
-            /* Set the background GIF */
             background-image: url('/static/landscape.gif');
-            background-size: cover; /* Ensures the GIF covers the whole screen */
-            background-position: center; /* Centers the GIF */
-            background-attachment: fixed; /* Prevents the GIF from scrolling */
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
         }
-
-        /* This creates the faded overlay effect */
         body::before {
             content: '';
-            position: fixed; /* Covers the entire viewport */
+            position: fixed;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
-            /* This is the fading layer. A semi-transparent white. */
             background-color: rgba(255, 255, 255, 0.275);
-            z-index: -1; /* Pushes this layer behind all other content */
+            z-index: -1;
         }
         #startup-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(240, 242, 245, 0.95); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
         #lesson-menu { background-color: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; }
         .lesson-button { display: block; width: 100%; padding: 15px 20px; font-size: 1.1em; margin-top: 10px; cursor: pointer; border: 1px solid #ccc; background-color: #fff; }
-        #main-content { display: flex; justify-content: center; align-items: center; gap: 20px; padding: 20px; max-width: 1200px; margin: auto; }
-        
-        /* --- MODIFIED: Character Container Styles --- */
-        #character-container {
-            height: 375px;
-            width: 375px;
-            position: relative; /* This is key for layering */
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        #character-container img {
-            height: 100%;
-            width: 100%;
-            object-fit: cover;
-            position: absolute; /* Make images stack */
-            top: 0;
-            left: 0;
-        }
-        /* --- NEW: Style for the Viseme Mouth --- */
-        #viseme-mouth {
-            /* Adjust size and position to fit your character image */
-            width: 50%; 
-            height: auto;
-            position: absolute;
-            top: 55%; /* Example: positions the top of the mouth 55% down */
-            z-index: 10; /* Ensure it's on top of the base image */
-        }
-
+        #main-content { display: none; justify-content: center; align-items: center; gap: 20px; padding: 20px; max-width: 1200px; margin: auto; }
+        #character-container { height: 375px; width: 375px; position: relative; display: flex; justify-content: center; align-items: center; }
+        #character-container img { height: 100%; width: 100%; object-fit: cover; position: absolute; top: 0; left: 0; }
+        #viseme-mouth { width: 50%; height: auto; position: absolute; top: 55%; z-index: 10; }
         #chat-container { flex: 1; max-width: 800px; background: #e0ffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); height: 600px; display: flex; flex-direction: column; }
         #conversation { flex-grow: 1; overflow-y: auto; }
         .message { margin: 10px 0; padding: 10px 15px; border-radius: 18px; line-height: 1.5; max-width: 70%; word-wrap: break-word; }
@@ -402,21 +460,16 @@ html = """
     <div id="startup-overlay">
         <div id="lesson-menu">
             <h2>HCV Training Program</h2>
-            <button id="lesson-1-btn" class="lesson-button">Lesson 1: Program Fundamentals</button>
-            <button id="skip-to-quiz-btn" class="lesson-button" style="background-color: #fffbe6;">Skip to Quiz (Dev)</button>
-            <button class="lesson-button" disabled>Lesson 2: Advanced Eligibility (Coming Soon...)</button>
-            <button class="lesson-button" disabled>Lesson 3: Rent Calculation (Coming Soon...)</button>
+            <button class="lesson-button" data-lesson-id="1">Lesson 1: Program Fundamentals</button>
+            <button class="lesson-button" data-lesson-id="2">Lesson 2: Advanced Eligibility</button>
+            <button class="lesson-button" data-lesson-id="3">Lesson 3: HCV Program Overview</button>
             <button class="lesson-button" disabled>Lesson 4: Inspections & Standards (Coming Soon...)</button>
         </div>
     </div>
     <div id="main-content">
-        <!-- --- MODIFIED: Character Container Content --- -->
         <div id="character-container">
             <img id="character-still" src="/static/talkinghouse.jpg" alt="AI Character Base">
-            <!-- This is the mouth that we will animate -->
             <img id="viseme-mouth" src="/static/visemes/viseme_0.png" alt="AI Character Mouth">
-            <!-- The talking video is no longer needed for this animation method -->
-            <!-- <video id="character-talking" src="/static/realTalkHouse.mp4" style="display: none;" loop muted playsinline></video> -->
         </div>
         <div id="chat-container">
             <div id="conversation"></div>
@@ -434,15 +487,14 @@ html = """
     </div>
 
     <script>
-        // --- DOM Elements ---
         const conversationDiv = document.getElementById('conversation');
         const quizOptionsDiv = document.getElementById('quiz-options');
         const statusSpan = document.getElementById('status');
         const micIndicator = document.getElementById('mic-indicator');
-        const characterStill = document.getElementById('character-still');
         const visemeMouth = document.getElementById('viseme-mouth');
+        const mainContent = document.getElementById('main-content');
+        const startupOverlay = document.getElementById('startup-overlay');
 
-        // --- Global State Variables ---
         let ws, audioContext, workletNode, vad, mediaStream, audioInput;
         let isPlaying = false;
         let currentAudioSource = null;
@@ -474,40 +526,37 @@ html = """
             registerProcessor('audio-processor', AudioProcessor);
         `;
         class VoiceActivityDetector {
-            constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 1.0) {
-                this.onSpeechStart = onSpeechStart; this.onSpeechEnd = onSpeechEnd; this.silenceThreshold = silenceThreshold;
-                this.analyser = null; this.isSpeaking = false; this.silenceStartTime = 0; this.animationFrameId = null;
-            }
-            start(context, sourceNode) {
-                this.analyser = context.createAnalyser(); this.analyser.fftSize = 512; sourceNode.connect(this.analyser);
-                this.isSpeaking = false; this.monitor();
-            }
+            constructor(onSpeechStart, onSpeechEnd, silenceThreshold = 0.8) { this.onSpeechStart = onSpeechStart; this.onSpeechEnd = onSpeechEnd; this.silenceThreshold = silenceThreshold; this.analyser = null; this.isSpeaking = false; this.silenceStartTime = 0; this.animationFrameId = null; }
+            start(context, sourceNode) { this.analyser = context.createAnalyser(); this.analyser.fftSize = 512; sourceNode.connect(this.analyser); this.isSpeaking = false; this.monitor(); }
             stop() { if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId); this.isSpeaking = false; }
             monitor = () => {
-                const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-                this.analyser.getByteFrequencyData(dataArray);
+                const dataArray = new Uint8Array(this.analyser.frequencyBinCount); this.analyser.getByteFrequencyData(dataArray);
                 const averageVolume = dataArray.reduce((sum, val) => sum + val, 0) / dataArray.length;
-                if (averageVolume > 5) {
-                    this.silenceStartTime = 0;
-                    if (!this.isSpeaking) { this.isSpeaking = true; this.onSpeechStart(); }
-                } else if (this.isSpeaking) {
-                    if (this.silenceStartTime === 0) this.silenceStartTime = Date.now();
-                    else if ((Date.now() - this.silenceStartTime) > this.silenceThreshold * 1000) { this.onSpeechEnd(); this.isSpeaking = false; }
-                }
+                if (averageVolume > 5) { this.silenceStartTime = 0; if (!this.isSpeaking) { this.isSpeaking = true; this.onSpeechStart(); } }
+                else if (this.isSpeaking) { if (this.silenceStartTime === 0) this.silenceStartTime = Date.now(); else if ((Date.now() - this.silenceStartTime) > this.silenceThreshold * 1000) { this.onSpeechEnd(); this.isSpeaking = false; } }
                 this.animationFrameId = requestAnimationFrame(this.monitor);
             }
         }
+
         document.addEventListener('DOMContentLoaded', () => {
             const completedLessons = JSON.parse(localStorage.getItem('completedLessons')) || [];
-            if (completedLessons.includes(1)) {
-                const lesson1Btn = document.getElementById('lesson-1-btn');
-                lesson1Btn.textContent = 'Lesson 1: Program Fundamentals (Completed)';
-                lesson1Btn.style.backgroundColor = '#d4edda'; // A light green color
-                lesson1Btn.style.borderColor = '#c3e6cb';
-            }
+            document.querySelectorAll('.lesson-button[data-lesson-id]').forEach(button => {
+                const lessonId = button.getAttribute('data-lesson-id');
+                if (completedLessons.includes(lessonId)) {
+                    button.textContent += ' (Completed)';
+                    button.style.backgroundColor = '#d4edda';
+                    button.style.borderColor = '#c3e6cb';
+                }
+                // NEW: Attach the single start function to all lesson buttons
+                button.onclick = () => startLesson(lessonId);
+            });
         });
-        async function initializeApp() {
-            document.getElementById('startup-overlay').style.display = 'none';
+
+        // --- NEW: Unified function to start any lesson ---
+        async function startLesson(lessonId) {
+            startupOverlay.style.display = 'none';
+            mainContent.style.display = 'flex';
+
             if (!audioContext) {
                 try {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -517,7 +566,23 @@ html = """
                 } catch (e) { console.error("Error initializing audio context:", e); return; }
             }
             await audioContext.resume();
-            connect();
+            
+            // Connect and provide a callback function to select the lesson once connected
+            connect(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // Check localStorage for a saved user name
+                    const savedUserName = localStorage.getItem('userName');
+                    
+                    console.log(`Sending select_lesson for lesson ID: ${lessonId}. User name: ${savedUserName}`);
+                    
+                    // Send the name along with the lesson ID
+                    ws.send(JSON.stringify({
+                        type: 'select_lesson',
+                        lesson_id: lessonId,
+                        user_name: savedUserName 
+                    }));
+                }
+            });
         }
 
         function connect(onOpenCallback) {
@@ -525,25 +590,17 @@ html = """
             ws.onopen = () => {
                 console.log("WebSocket connected.");
                 setupSpeedControls();
-                if (onOpenCallback) {
-                    onOpenCallback(); // <<< CALL THE CALLBACK
-                }
+                if (onOpenCallback) onOpenCallback();
             };
             ws.onclose = () => { statusSpan.textContent = "Disconnected"; stopContinuousListening(); };
             ws.onerror = (error) => console.error("WebSocket Error:", error);
-            
             ws.onmessage = (event) => {
-                if (event.data instanceof Blob) {
-                    currentAudioChunks.push(event.data);
-                } else if (typeof event.data === 'string') {
+                if (event.data instanceof Blob) currentAudioChunks.push(event.data);
+                else if (typeof event.data === 'string') {
                     const message = JSON.parse(event.data);
-                    if (message.type === 'tts_stream_finished') {
-                        playCombinedAudio();
-                    } else if (message.type === 'viseme') {
-                        visemeQueue.push(message);
-                    } else {
-                        handleTextMessage(message);
-                    }
+                    if (message.type === 'tts_stream_finished') playCombinedAudio();
+                    else if (message.type === 'viseme') visemeQueue.push(message);
+                    else handleTextMessage(message);
                 }
             };
         }
@@ -551,62 +608,35 @@ html = """
         function animateVisemes(audioStartTime) {
             const elapsedTime = (audioContext.currentTime - audioStartTime) * 1000;
             let latestViseme = null;
-            while (visemeQueue.length > 0 && visemeQueue[0].offset_ms <= elapsedTime) {
-                latestViseme = visemeQueue.shift();
-            }
-            if (latestViseme) {
-                visemeMouth.src = visemeMap[latestViseme.viseme_id];
-            }
-            if (isPlaying) {
-                animationFrameId = requestAnimationFrame(() => animateVisemes(audioStartTime));
-            }
+            while (visemeQueue.length > 0 && visemeQueue[0].offset_ms <= elapsedTime) latestViseme = visemeQueue.shift();
+            if (latestViseme) visemeMouth.src = visemeMap[latestViseme.viseme_id];
+            if (isPlaying) animationFrameId = requestAnimationFrame(() => animateVisemes(audioStartTime));
         }
 
         async function playCombinedAudio() {
             if (currentAudioChunks.length === 0 || !audioContext) return;
-            
             isPlaying = true;
-            stopContinuousListening(); // Mic off while AI speaks
-            
-            characterStill.style.opacity = 1;
+            stopContinuousListening();
             visemeMouth.style.display = 'block';
-            
             const audioBlob = new Blob(currentAudioChunks, { type: 'audio/mp3' });
             currentAudioChunks = [];
-
             try {
                 const arrayBuffer = await audioBlob.arrayBuffer();
                 const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-                if (currentAudioSource) { currentAudioSource.stop(); }
+                if (currentAudioSource) currentAudioSource.stop();
                 if (animationFrameId) cancelAnimationFrame(animationFrameId);
-
                 currentAudioSource = audioContext.createBufferSource();
                 currentAudioSource.buffer = audioBuffer;
                 currentAudioSource.connect(audioContext.destination);
-
                 currentAudioSource.onended = () => {
-                    isPlaying = false;
-                    visemeMouth.src = visemeMap[0];
-                    visemeQueue = [];
-                    cancelAnimationFrame(animationFrameId);
-                    
-                    // --- THE FIX IS RESTORING THIS CALL ---
-                    // After the AI finishes speaking, we immediately check if we should start listening.
+                    isPlaying = false; visemeMouth.src = visemeMap[0]; visemeQueue = []; cancelAnimationFrame(animationFrameId);
                     startContinuousListening(); 
-                    
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
-                    }
+                    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'control', command: 'tts_finished' }));
                 };
-                
                 const audioStartTime = audioContext.currentTime;
                 currentAudioSource.start(0);
                 animateVisemes(audioStartTime);
-            } catch (e) {
-                console.error("Error decoding or playing audio:", e);
-                isPlaying = false;
-            }
+            } catch (e) { console.error("Error decoding or playing audio:", e); isPlaying = false; }
         }
         
         function stopContinuousListening() {
@@ -619,72 +649,69 @@ html = """
         async function startContinuousListening() {
             stopContinuousListening();
             if (isPlaying || !audioContext) return;
-
             const state = statusSpan.textContent;
-            const isConversational = [
-                'INTRODUCTION', 'LESSON_QUESTION', 'LESSON_QNA', 'QNA'
-            ].includes(state);
-
-            if (!isConversational) return;
-
+            if (!['INTRODUCTION', 'LESSON_QUESTION', 'LESSON_QNA', 'QNA'].includes(state)) return;
             try {
                 await audioContext.resume();
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, echoCancellation: true, noiseSuppression: true } });
                 audioInput = audioContext.createMediaStreamSource(mediaStream);
                 audioInput.connect(workletNode);
                 workletNode.port.onmessage = (event) => { if (ws.readyState === WebSocket.OPEN) ws.send(event.data.buffer); };
-                
                 vad = new VoiceActivityDetector(
                     () => { micIndicator.classList.add('listening'); ws.send(JSON.stringify({ type: 'control', command: 'start_speech' })); },
-                    () => { 
-                        stopContinuousListening();
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                           ws.send(JSON.stringify({ type: 'control', command: 'end_speech' })); 
-                        }
-                    }
+                    () => { stopContinuousListening(); if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'control', command: 'end_speech' })); }
                 );
                 vad.start(audioContext, audioInput);
             } catch (err) { console.error("Mic start error:", err); }
         }
         
-        function updateUIForState(state) {
-            statusSpan.textContent = state;
-            // This call remains important for handling state changes that don't involve audio playback.
-            //startContinuousListening(); 
-        }
-
         function handleTextMessage(message) {
             clearQuizOptions();
-            if (message.type === 'state_update') {
-                updateUIForState(message.state);
-            } else if (message.type === 'ai_response') {
-                addMessage(message.text, 'ai');
-            } else if (message.type === 'user_transcript') {
-                addMessage(message.text, 'user');
-            } else if (message.type === 'quiz_question') {
+            if (message.type === 'state_update') statusSpan.textContent = message.state;
+            else if (message.type === 'ai_response') addMessage(message.text, 'ai');
+            else if (message.type === 'user_transcript') addMessage(message.text, 'user');
+            else if (message.type === 'user_identity_set') {
+                console.log(`Received user name from backend: ${message.name}. Saving to localStorage.`);
+                localStorage.setItem('userName', message.name);
+            }
+            else if (message.type === 'quiz_question') {
                 addMessage(message.text, 'ai');
                 displayQuizOptions(message.options);
-            } 
-            // --- NEW CASE ---
-            else if (message.type === 'quiz_summary') {
-                // 1. Display the summary text in the chat
+            } else if (message.type === 'quiz_summary') {
                 addMessage(message.text, 'ai');
-
-                // 2. Mark the lesson as complete in localStorage
                 let completedLessons = JSON.parse(localStorage.getItem('completedLessons')) || [];
-                if (!completedLessons.includes(message.lesson_id)) {
-                    completedLessons.push(message.lesson_id);
+                const lessonIdStr = message.lesson_id.toString();
+                if (!completedLessons.includes(lessonIdStr)) {
+                    completedLessons.push(lessonIdStr);
                     localStorage.setItem('completedLessons', JSON.stringify(completedLessons));
                 }
-
-                // 3. Create the "Return to Menu" button
                 const returnBtn = document.createElement('button');
                 returnBtn.className = 'lesson-button';
                 returnBtn.textContent = 'Return to Lesson Menu';
-                returnBtn.onclick = () => {
-                    window.location.reload(); // Simple way to reset and go to the menu
-                };
+                returnBtn.onclick = () => window.location.reload();
                 quizOptionsDiv.appendChild(returnBtn);
+            }
+            else if (message.type === 'rag_start') {
+                // Create a new empty message bubble that we can add to.
+                const messageElem = document.createElement('div');
+                messageElem.classList.add('message', 'ai-message', 'streaming-message');
+                conversationDiv.appendChild(messageElem);
+                conversationDiv.scrollTop = conversationDiv.scrollHeight;
+            }
+            else if (message.type === 'rag_chunk') {
+                // Find the streaming bubble and append the new text.
+                const streamingMessage = document.querySelector('.streaming-message');
+                if (streamingMessage) {
+                    streamingMessage.innerHTML += message.text.replace(/\\n/g, '<br>');
+                    conversationDiv.scrollTop = conversationDiv.scrollHeight;
+                }
+            }
+            else if (message.type === 'rag_end') {
+                // Find the bubble and remove the special class so we're ready for the next stream.
+                const streamingMessage = document.querySelector('.streaming-message');
+                if (streamingMessage) {
+                    streamingMessage.classList.remove('streaming-message');
+                }
             }
         }
 
@@ -697,9 +724,7 @@ html = """
                     interruptSpeech();
                     const selectedOption = optionText.charAt(0);
                     addMessage(optionText, 'user');
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'quiz_answer', answer: selectedOption }));
-                    }
+                    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'quiz_answer', answer: selectedOption }));
                     clearQuizOptions();
                 };
                 quizOptionsDiv.appendChild(button);
@@ -717,254 +742,555 @@ html = """
         function clearQuizOptions() { quizOptionsDiv.innerHTML = ''; }
 
         function setupSpeedControls() {
-            const speedButtons = document.querySelectorAll('.speed-button');
-            speedButtons.forEach(button => {
+            document.querySelectorAll('.speed-button').forEach(button => {
                 button.addEventListener('click', () => {
-                    speedButtons.forEach(btn => btn.classList.remove('active'));
+                    document.querySelectorAll('.speed-button').forEach(btn => btn.classList.remove('active'));
                     button.classList.add('active');
-                    const newRate = button.getAttribute('data-rate');
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'set_speed', rate: newRate }));
-                    }
+                    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'set_speed', rate: button.getAttribute('data-rate') }));
                 });
             });
         }
 
-        // This is the original function for starting the full lesson
-        async function startFullLesson() {
-            document.getElementById('startup-overlay').style.display = 'none';
-            if (!audioContext) {
-                try {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                    const blob = new Blob([workletCode], { type: 'application/javascript' });
-                    await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
-                    workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
-                } catch (e) { console.error("Error initializing audio context:", e); return; }
-            }
-            await audioContext.resume();
-            connect(); // Connect with no special callback, starting the default flow
-        }
-
-        // --- NEW: This function handles the "skip to quiz" logic ---
-        async function skipToQuiz() {
-            document.getElementById('startup-overlay').style.display = 'none';
-            if (!audioContext) {
-                try {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                    const blob = new Blob([workletCode], { type: 'application/javascript' });
-                    await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
-                    workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
-                } catch (e) { console.error("Error initializing audio context:", e); return; }
-            }
-            await audioContext.resume();
-            // Connect and provide a callback function to be executed on connection
-            connect(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    console.log("Sending skip_to_quiz command...");
-                    ws.send(JSON.stringify({ type: 'skip_to_quiz' }));
-                }
-            });
-        }
-
         function interruptSpeech() {
-            // 1. Stop any audio source that is currently playing.
-            if (currentAudioSource) {
-                currentAudioSource.stop();
-                currentAudioSource.onended = null; // Prevent the old onended event from firing
-                currentAudioSource = null;
-            }
-
-            // 2. Cancel the animation loop.
-            if (animationFrameId) {
-                cancelAnimationFrame(animationFrameId);
-                animationFrameId = null;
-            }
-
-            // 3. Reset all state variables and data queues.
-            isPlaying = false;
-            currentAudioChunks = []; // Crucially, clear out old audio chunks
-            visemeQueue = [];       // And old viseme data
-
-            // 4. Reset the character's mouth to the neutral, closed position.
+            if (currentAudioSource) { currentAudioSource.stop(); currentAudioSource.onended = null; currentAudioSource = null; }
+            if (animationFrameId) { cancelAnimationFrame(animationFrameId); animationFrameId = null; }
+            isPlaying = false; currentAudioChunks = []; visemeQueue = [];
             visemeMouth.src = visemeMap[0];
-
             console.log("Speech interrupted by user action. Audio system reset.");
         }
-
-        // Assign the functions to the correct buttons
-        document.getElementById('lesson-1-btn').onclick = startFullLesson;
-        document.getElementById('skip-to-quiz-btn').onclick = skipToQuiz;
     </script>
 </body>
 </html>
 """
+# REPLACE your existing StreamingAsyncCallbackHandler with this one
+
+class StreamingAsyncCallbackHandler(BaseCallbackHandler):
+    """Callback handler for streaming LLM responses to a WebSocket."""
+
+    def __init__(self, websocket: WebSocket):
+        super().__init__()
+        self.websocket = websocket
+        self.full_response = ""
+
+    async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs: Any) -> None:
+        """Log when the LLM starts and send a start message."""
+        logger.info("--- LLM Streaming Started ---")
+        await self.websocket.send_json({"type": "rag_start"})
+
+    async def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        """Log and stream every new token."""
+        logger.info(f"LLM New Token: '{token}'")
+        self.full_response += token
+        await self.websocket.send_json({"type": "rag_chunk", "text": token})
+
+    async def on_llm_end(self, response, **kwargs: Any) -> None:
+        """Log the raw response and send an end message."""
+        logger.info("--- LLM Streaming Ended ---")
+        
+        # This will print the detailed response object from the provider
+        logger.info(f"Raw LLM Response: {response}") 
+        
+        await self.websocket.send_json({"type": "rag_end"})
+        logger.info(f"Callback stream finished. Full response: {self.full_response}")
+
+# --- Main Endpoints ---
+class ConnectionManager:
+    def __init__(self, websocket: WebSocket, retriever: Any, llm: Any):
+        self.websocket = websocket
+        self.current_state = AppState.IDLE
+        self.speech_rate = "+11.50%"
+        self.dialogflow_session_path = ""
+        self.audio_input_queue: Optional[asyncio.Queue] = None
+        self.lesson_step = 0
+        self.quiz_step = 0
+        self.quiz_score = 0
+        self.selected_lesson_id: Optional[str] = None
+        self.current_lesson_flow: List[Dict] = []
+        self.current_quiz_questions: List[Dict] = []
+        self.user_name: Optional[str] = None
+        self.speech_processing_task: Optional[asyncio.Task] = None
+        self.tts_completion_event: Optional[asyncio.Event] = None
+        self.retriever = retriever
+        self.llm = llm
+        self.sentence_delimiters = re.compile(r'(?<=[.!?])\s+')
+
+    async def _get_dialogflow_response(self, transcript_text: str):
+        session_path = self.dialogflow_session_path
+        text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
+        query_input = dialogflow.QueryInput(text=text_input)
+        try:
+            response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
+            return response.query_result
+        except GoogleAPIError as e:
+            logger.error(f"Dialogflow API error: {e}")
+            return f"Dialogflow Error: {e}"
+    async def tts_task_manager(self, tts_queue: asyncio.Queue):
+        while True:
+            # Wait for a sentence to be put into the queue.
+            sentence = await tts_queue.get()
+            
+            if sentence is None:
+                # A 'None' is our signal that the stream is finished.
+                break
+                
+            logger.info(f"[TTS Manager] Now speaking sentence: '{sentence}'")
+            # Generate and stream the audio for this single sentence.
+            await stream_azure_tts_and_send_to_client(sentence, self.websocket, self.speech_rate)
+
+        logger.info("[TTS Manager] Finished processing all sentences.")
+    async def run(self):
+        """The main loop to handle incoming WebSocket messages."""
+        await self.transition_to_state(AppState.IDLE)
+        try:
+            # Loop continuously while the connection is open
+            while self.websocket.client_state == WebSocketState.CONNECTED:
+                message = await self.websocket.receive()
+                
+                # Handle incoming audio bytes
+                if "bytes" in message:
+                    if self.audio_input_queue:
+                        await self.audio_input_queue.put(message["bytes"])
+                
+                # Handle incoming text messages (JSON)
+                elif "text" in message:
+                    await self.handle_text_message(json.loads(message["text"]))
+
+        except WebSocketDisconnect:
+            logger.info("Client disconnected.")
+        except Exception as e:
+            logger.error(f"Error in ConnectionManager run loop: {e}", exc_info=True)
+        finally:
+            logger.info("WebSocket connection closed.")
+    # The final, correct version of your streaming function
+    # In your ConnectionManager class, REPLACE the old function with this one
+
+    async def _get_rag_response_and_stream_audio(self, transcript_text: str):
+        overall_start_time = time.monotonic()
+        logger.info(f"[TIMER] TRUE STREAM RAG STARTED for: '{transcript_text}'")
+
+        if not self.retriever or not self.llm:
+            await self.speak("My document search system isn't configured.", AppState.QNA)
+            return
+
+        # --- 1. Document Retrieval ---
+        retrieval_start_time = time.monotonic()
+        retrieved_docs = await self.retriever.ainvoke(transcript_text)
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        retrieval_duration = time.monotonic() - retrieval_start_time
+        logger.info(f"[TIMER] Document Retrieval FINISHED in {retrieval_duration:.2f} seconds.")
+        
+        prompt_string = f"""
+You are an AI assistant for housing policies. Use the following context to answer the user's question.
+- Synthesize the context into a concise answer.[one or two sentences]
+- If the context does not contain relevant information, state that you cannot find the answer in the provided documents.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{transcript_text}
+"""
+        
+        token_queue = asyncio.Queue()
+        tts_sentence_queue = asyncio.Queue()
+        
+        def producer(loop, t_queue):
+            """
+            (Instrumented for Debugging)
+            Synchronous function that iterates over the Google stream, LOGS EVERY
+            TOKEN, and puts each token into the asyncio queue.
+            """
+            try:
+                logger.info("[PRODUCER] Starting Google stream... Waiting for first byte from API.")
+                responses = self.llm.generate_content(prompt_string, stream=True)
+                
+                # --- Start of new logging instrumentation ---
+                last_token_time = time.monotonic()
+                token_count = 0
+                logger.info("==================== TOKEN STREAM START ====================")
+                # --- End of new logging instrumentation ---
+
+                for chunk in responses:
+                    if chunk.text:
+                        # --- Logging each and every token ---
+                        now = time.monotonic()
+                        delta = now - last_token_time
+                        token_count += 1
+                        logger.info(f"[PRODUCER-STREAM] Token #{token_count:03d} | ΔT: {delta:.4f}s | Content: '{chunk.text}'")
+                        last_token_time = now
+                        # --- End of token logging ---
+
+                        loop.call_soon_threadsafe(t_queue.put_nowait, chunk.text)
+            finally:
+                logger.info("==================== TOKEN STREAM END ======================")
+                # Signal the end of the stream
+                loop.call_soon_threadsafe(t_queue.put_nowait, None)
+            logger.info("[PRODUCER] Google stream finished. Producer thread is closing.")
+
+        # --- 4. The Consumer (no changes needed here) ---
+        async def consumer():
+            """
+            Asynchronous function that gets tokens from the queue as they arrive,
+            sends them to the client, and forms/queues sentences for TTS.
+            """
+            await self.websocket.send_json({"type": "rag_start"})
+            full_response_text = ""
+            current_sentence = ""
+            first_token_received = False
+            
+            tts_manager_task = asyncio.create_task(self.tts_task_manager(tts_sentence_queue))
+
+            while True:
+                token = await token_queue.get()
+                if token is None:
+                    break
+
+                if not first_token_received:
+                    time_to_first_token = time.monotonic() - overall_start_time
+                    logger.info(f"[TIMER] Time to First Token: {time_to_first_token:.2f} seconds.")
+                    first_token_received = True
+
+                await self.websocket.send_json({"type": "rag_chunk", "text": token})
+                
+                full_response_text += token
+                current_sentence += token
+
+                parts = self.sentence_delimiters.split(current_sentence)
+                if len(parts) > 1:
+                    for sentence_part in parts[:-1]:
+                        if sentence_part.strip():
+                            await tts_sentence_queue.put(sentence_part.strip())
+                    current_sentence = parts[-1]
+
+            if current_sentence.strip():
+                await tts_sentence_queue.put(current_sentence.strip())
+            
+            await tts_sentence_queue.put(None)
+            await tts_manager_task
+            
+            await self.websocket.send_json({"type": "rag_end"})
+            logger.info(f"Full RAG Response: {full_response_text}")
+            overall_duration = time.monotonic() - overall_start_time
+            logger.info(f"[TIMER] TRUE STREAM RAG FINISHED in {overall_duration:.2f} seconds.")
+            
+            await self.speak("Do you have any other questions?", AppState.QNA)
+
+        # --- 5. Start the producer and run the consumer (with arguments) ---
+        loop = asyncio.get_running_loop()
+        # Pass the loop and queue as arguments to the producer
+        loop.run_in_executor(None, producer, loop, token_queue)
+        await consumer()
+
+
+
+    async def tts_task_manager(self, tts_queue: asyncio.Queue):
+        """
+        (FINAL) Pulls sentences from a queue, plays their audio, and waits
+        for client confirmation before playing the next one.
+        """
+        while True:
+            sentence = await tts_queue.get()
+            if sentence is None:
+                break
+                
+            logger.info(f"[TTS Manager] Now speaking sentence: '{sentence}'")
+            
+            # 1. Create a new event for this specific sentence.
+            self.tts_completion_event = asyncio.Event()
+            
+            # 2. Start the TTS generation. This is non-blocking.
+            await stream_azure_tts_and_send_to_client(sentence, self.websocket, self.speech_rate)
+            
+            # 3. Wait for the `tts_finished` signal from the client for this sentence.
+            logger.info("[TTS Manager] Waiting for client confirmation...")
+            try:
+                await asyncio.wait_for(self.tts_completion_event.wait(), timeout=20.0)
+                logger.info("[TTS Manager] Client confirmed sentence finished.")
+            except asyncio.TimeoutError:
+                logger.warning("[TTS Manager] Timed out waiting for client confirmation.")
+            finally:
+                self.tts_completion_event = None
+
+        logger.info("[TTS Manager] Finished processing all sentences.")
+
+
+    async def transition_to_state(self, new_state: AppState):
+        self.current_state = new_state
+        logger.info(f"Transitioning to state: {self.current_state.value}")
+        await self.websocket.send_json({"type": "state_update", "state": self.current_state.value})
+
+    async def advance_lesson(self):
+        """
+        Main lesson advancement logic. This function now loops through consecutive
+        lecture steps automatically, only stopping when user input is required.
+        """
+        logger.info("[ADVANCE_LESSON] Entering lesson advancement loop...")
+
+        # Loop as long as there are steps left in the lesson.
+        while self.lesson_step < len(self.current_lesson_flow):
+            step_data = self.current_lesson_flow[self.lesson_step]
+            text = step_data["text"]
+            step_type = step_data["type"]
+
+            logger.info(f"[ADVANCE_LESSON] Processing step {self.lesson_step}, type: {step_type}")
+
+            # Check the type of the current step
+            if step_type == "lecture":
+                # For a lecture, we speak, wait for it to complete, and then loop again.
+                await self.speak(text, AppState.LESSON_DELIVERY)
+                await self._wait_for_tts_completion()
+                self.lesson_step += 1  # Move to the next step
+                continue  # Immediately continue to the next iteration of the loop
+            
+            elif step_type == "question" or step_type == "qna_prompt":
+                # For a question or prompt, we speak and then STOP.
+                # The system must wait for the user to respond.
+                next_state = AppState.LESSON_QUESTION if step_type == "question" else AppState.LESSON_QNA
+                await self.speak(text, next_state)
+                self.lesson_step += 1  # Increment step so we don't repeat it
+                logger.info("[ADVANCE_LESSON] Pausing for user input.")
+                return  # EXIT the function here.
+
+        # If the while loop completes, it means all steps are done.
+        logger.info("[ADVANCE_LESSON] Lesson flow finished. Starting quiz.")
+        await self.speak("Okay, let's start the final quiz.", AppState.QUIZ_START)
+        await self._wait_for_tts_completion()
+        await self.advance_quiz()
+
+    async def advance_quiz(self):
+        if self.quiz_step < len(self.current_quiz_questions):
+            question_data = self.current_quiz_questions[self.quiz_step]
+            self.quiz_step += 1
+            await self.transition_to_state(AppState.QUIZ_QUESTION)
+            await self.websocket.send_json({"type": "quiz_question", "text": question_data['text'], "options": question_data['options']})
+            tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
+            await stream_azure_tts_and_send_to_client(tts_text, self.websocket, self.speech_rate)
+        else:
+            await self.transition_to_state(AppState.QUIZ_COMPLETE)
+            summary = f"You've completed the quiz! You scored {self.quiz_score} out of {len(self.current_quiz_questions)}. Great job."
+            await self.websocket.send_json({"type": "quiz_summary", "text": summary, "lesson_id": self.selected_lesson_id})
+            await stream_azure_tts_and_send_to_client(summary, self.websocket, self.speech_rate)
+
+    async def speak(self, text: str, next_state: Optional[AppState] = None):
+        """
+        (Fire-and-Forget) Sends text to the client and starts the TTS stream.
+        Does NOT wait for completion.
+        """
+        logger.info(f"[SPEAK] Sending text: '{text}' and transitioning to state: {next_state.value if next_state else 'None'}")
+        if next_state:
+            await self.transition_to_state(next_state)
+        
+        # Send the text to be displayed in the chat bubble
+        await self.websocket.send_json({"type": "ai_response", "text": text})
+        
+        # Start the TTS audio stream in the background
+        asyncio.create_task(stream_azure_tts_and_send_to_client(text, self.websocket, self.speech_rate))
+        logger.info(f"[SPEAK] TTS stream started for: '{text}'")
+
+    async def _wait_for_tts_completion(self):
+        """
+        Creates and waits for a TTS completion event from the client.
+        This is now the ONLY place where we wait for this specific event.
+        """
+        try:
+            # Create a new, unique event for this specific wait period
+            self.tts_completion_event = asyncio.Event()
+            logger.info("[WAIT] Now waiting for 'tts_finished' signal from client...")
+            # Wait for the event to be set, with a generous timeout
+            await asyncio.wait_for(self.tts_completion_event.wait(), timeout=60.0)
+            logger.info("[WAIT] 'tts_finished' signal received. Wait complete.")
+        except asyncio.TimeoutError:
+            logger.warning("[WAIT] Timed out waiting for 'tts_finished' signal.")
+        finally:
+            # Clean up the event so we don't accidentally re-use it
+            self.tts_completion_event = None
+
+    async def _send_thinking_and_wait(self):
+        start_time = time.monotonic()
+        logger.info("[TIMER] 'Thinking & Waiting' task STARTED.")
+        self.tts_completion_event = asyncio.Event()
+
+        thinking_phrases = [
+                    "Let me check.", "One moment.", "Let's see.",
+                    "Good question!", "Interesting thought.", "Let me think about that.",
+                    "Hmm, that's a good one.", "Let me look that up for you.", "That's an interesting question.", "One second"
+                ]
+        thinking_text = random.choice(thinking_phrases)
+        await self.send_ai_response(thinking_text, AppState.QNA)
+
+        logger.info("[TIMER] 'Thinking & Waiting' task now waiting for client 'tts_finished' signal...")
+        try:
+            await asyncio.wait_for(self.tts_completion_event.wait(), timeout=15.0)
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            logger.info(f"[TIMER] 'Thinking & Waiting' task FINISHED. Client confirmed TTS. Duration: {duration:.2f} seconds.")
+        except asyncio.TimeoutError:
+            end_time = time.monotonic()
+            duration = end_time - start_time
+            logger.warning(f"[TIMER] 'Thinking & Waiting' task TIMED OUT. Duration: {duration:.2f} seconds.")
+        finally:
+            self.tts_completion_event = None
+
+    async def handle_user_transcript(self, transcript: str):
+        await self.websocket.send_json({"type": "user_transcript", "text": transcript})
+        # Launch the logic handler as a non-blocking background task.
+        asyncio.create_task(self.handle_transcript_logic(transcript))
+
+    async def handle_quiz_answer_logic(self, data: dict):
+        """Handles the logic for a submitted quiz answer."""
+        question_data = self.current_quiz_questions[self.quiz_step - 1]
+        is_correct = data.get("answer") == question_data['correct_answer']
+        
+        if is_correct:
+            self.quiz_score += 1
+            feedback = "Correct!"
+        else:
+            feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
+
+        await self.speak(feedback, AppState.QUIZ_FEEDBACK)
+        await self._wait_for_tts_completion()
+        await self.advance_quiz()
+
+    async def handle_transcript_logic(self, transcript: str):
+        """Contains the actual logic for processing a user's speech."""
+        current_state = self.current_state
+        logger.info(f"Handling transcript logic in state '{current_state.value}': '{transcript}'")
+
+        if current_state == AppState.INTRODUCTION:
+            self.user_name = extract_name(transcript) or "there"
+            await self.websocket.send_json({"type": "user_identity_set", "name": self.user_name})
+            
+            await self.speak(f"It's nice to meet you, {self.user_name}! Let's get started.", AppState.LESSON_PROLOGUE)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+        
+        elif current_state == AppState.LESSON_QUESTION:
+            step_data = self.current_lesson_flow[self.lesson_step - 1]
+            user_answer_lower = transcript.lower()
+            correct_answers = [ans.strip().lower() for ans in str(step_data['correct_answer']).split(',')]
+            is_correct = any(answer in user_answer_lower for answer in correct_answers)
+            
+            feedback = step_data['feedback_correct'] if is_correct else step_data['feedback_incorrect']
+            
+            await self.speak(feedback, AppState.LESSON_FEEDBACK)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+
+        elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
+            # This function is already fully async and handles its own streaming, so it's safe to call directly.
+            await self._get_rag_response_and_stream_audio(transcript)
+
+    async def _start_lesson_logic(self):
+        """
+        This is the main, non-blocking logic flow for starting and advancing a lesson.
+        It runs as a separate task so it doesn't block the main message-receiving loop.
+        """
+        logger.info("[LOGIC_TASK] Starting lesson logic...")
+
+        # Determine if it's a new or returning user to decide the greeting.
+        if self.user_name:
+            # Returning user
+            response_text = f"Welcome back, {self.user_name}! Let's begin Lesson {self.selected_lesson_id}."
+            await self.speak(response_text, AppState.LESSON_PROLOGUE)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+        else:
+            # New user: just ask for their name. The logic will be picked up
+            # by handle_user_transcript after they speak.
+            await self.speak("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)  
+
+    async def process_speech_result(self, stt_results_queue: asyncio.Queue):
+        try:
+            transcript = await stt_results_queue.get()
+            if transcript:
+                await self.handle_user_transcript(transcript)
+            else:
+                logger.warning("STT returned an empty transcript.")
+                await self.send_ai_response("I'm sorry, I didn't quite catch that. Could you say it again?")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in process_speech_result: {e}", exc_info=True)
+            await self.send_ai_response("I'm sorry, an error occurred while processing your speech.")
+
+        finally:
+            logger.info("Speech processing task finished. Resetting for next interaction.")
+            self.speech_processing_task = None
+
+    async def handle_text_message(self, data: dict):
+        msg_type = data.get("type")
+        logger.info(f"Received WebSocket message of type: {msg_type}")
+        if msg_type == "select_lesson":
+            lesson_id = data.get("lesson_id")
+            saved_user_name = data.get("user_name") 
+            if lesson_id and lesson_id in lessons:
+                # 1. Set up all the state variables for the new lesson.
+                self.selected_lesson_id = lesson_id
+                self.current_lesson_flow = lessons[lesson_id]["flow"]
+                self.current_quiz_questions = lessons[lesson_id]["quiz"]
+                self.user_name = saved_user_name  # Can be None if it's a new user
+                self.lesson_step = 0; self.quiz_step = 0; self.quiz_score = 0
+                
+                # 2. Launch the main logic as a background task. DO NOT await it.
+                # This immediately frees the run() loop to listen for more messages.
+                asyncio.create_task(self._start_lesson_logic())
+        elif msg_type == "set_speed":
+            new_rate = data.get("rate")
+            if new_rate:
+                self.speech_rate = new_rate
+                logger.info(f"Client set speech rate to: {self.speech_rate}")
+        elif msg_type == "control":
+            command = data.get("command")
+            if command == "start_speech":
+                if self.audio_input_queue is None:
+                    self.audio_input_queue = asyncio.Queue()
+                    stt_results_queue = asyncio.Queue(maxsize=1)
+                    session_id = f"{self.websocket.client.host}-{self.websocket.client.port}-{time.time()}"
+                    self.dialogflow_session_path = dialogflow_sessions_client.session_path(settings.GOOGLE_CLOUD_PROJECT_ID, session_id)
+                    asyncio.create_task(transcribe_speech(self.audio_input_queue, stt_results_queue))
+                    if self.speech_processing_task is None or self.speech_processing_task.done():
+                        self.speech_processing_task = asyncio.create_task(self.process_speech_result(stt_results_queue))
+
+            elif command == "end_speech":
+                if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None
+            if command == "tts_finished":
+                if self.tts_completion_event and not self.tts_completion_event.is_set():
+                    logger.info("Signal received. Setting tts_completion_event.")
+                    self.tts_completion_event.set()
+        elif msg_type == "quiz_answer":
+            asyncio.create_task(self.handle_quiz_answer_logic(data))
+
+    async def run(self):
+        await self.transition_to_state(AppState.IDLE)
+        try:
+            while self.websocket.client_state == WebSocketState.CONNECTED:
+                message = await self.websocket.receive()
+                if "bytes" in message:
+                    if self.audio_input_queue: await self.audio_input_queue.put(message["bytes"])
+                elif "text" in message:
+                    await self.handle_text_message(json.loads(message["text"]))
+        except WebSocketDisconnect:
+            logger.info("Client disconnected.")
+        except Exception as e:
+            logger.error(f"Error in connection manager: {e}", exc_info=True)
+        finally:
+            logger.info("WebSocket connection closed.")
 
 # --- Main Endpoints ---
 @app.get("/")
-async def get():
-    return HTMLResponse(html)
+async def get(): return HTMLResponse(html)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established.")
+    retriever = websocket.app.state.retriever
+    llm = websocket.app.state.llm
+    if not retriever or not llm:
+        logger.error("Retriever or LLM not available. Closing connection.")
+        await websocket.close(code=1011, reason="Server configuration error.")
+        return
+    manager = ConnectionManager(websocket, retriever=retriever, llm=llm)
+    await manager.run()
 
-    # --- STATE MANAGEMENT ---
-    current_state = AppState.IDLE
-    speech_rate = "+11.50%" 
-    dialogflow_session_path = ""
-    audio_input_queue = None
-    lesson_step = 0
-    quiz_step = 0
-    # --- NEW: Variable to track the quiz score ---
-    quiz_score = 0
-
-    async def transition_to_state(new_state: AppState):
-        nonlocal current_state
-        current_state = new_state
-        logger.info(f"Transitioning to state: {current_state.value}")
-        await websocket.send_json({"type": "state_update", "state": current_state.value})
-
-    async def advance_lesson():
-        nonlocal lesson_step
-        if lesson_step < len(lesson_flow):
-            step_data = lesson_flow[lesson_step]
-            lesson_step += 1
-            text = step_data["text"]
-
-            if step_data["type"] == "lecture":
-                await transition_to_state(AppState.LESSON_DELIVERY)
-            elif step_data["type"] == "question":
-                await transition_to_state(AppState.LESSON_QUESTION)
-            elif step_data["type"] == "qna_prompt":
-                await transition_to_state(AppState.LESSON_QNA)
-
-            await websocket.send_json({"type": "ai_response", "text": text})
-            await stream_azure_tts_and_send_to_client(text, websocket, speech_rate)
-        else:
-            # This path is taken if the user says "no" to the mid-lesson Q&A
-            response_text = "Okay, let's start the final quiz."
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            await transition_to_state(AppState.QUIZ_START)
-
-    # --- MODIFIED: The advance_quiz function is completely new ---
-    async def advance_quiz():
-        nonlocal quiz_step
-        if quiz_step < len(quiz_questions):
-            question_data = quiz_questions[quiz_step]
-            quiz_step += 1
-            await transition_to_state(AppState.QUIZ_QUESTION)
-            await websocket.send_json({
-                "type": "quiz_question", 
-                "text": question_data['text'],
-                "options": question_data['options']
-            })
-            tts_text = f"{question_data['text']}\n" + "\n".join(question_data['options'])
-            await stream_azure_tts_and_send_to_client(tts_text, websocket, speech_rate)
-        else:
-            # --- NEW: This is the final summary logic ---
-            await transition_to_state(AppState.QUIZ_COMPLETE)
-            
-            # 1. Create the summary text
-            summary_text = f"You've completed the quiz! You scored {quiz_score} out of {len(quiz_questions)}. Great job."
-            
-            # 2. Send a special message type to the frontend
-            await websocket.send_json({
-                "type": "quiz_summary",
-                "text": summary_text,
-                "lesson_id": 1 # To mark Lesson 1 as complete
-            })
-            
-            # 3. Send the audio for the summary
-            await stream_azure_tts_and_send_to_client(summary_text, websocket, speech_rate)
-
-    try:
-        await transition_to_state(AppState.INTRODUCTION)
-        intro_text = "Hello! I'm your HCV trainer. Before we begin, what's your name?"
-        await websocket.send_json({"type": "ai_response", "text": intro_text})
-        await stream_azure_tts_and_send_to_client(intro_text, websocket, speech_rate)
-
-        while websocket.client_state == WebSocketState.CONNECTED:
-            message = await websocket.receive()
-            if "bytes" in message:
-                if audio_input_queue: await audio_input_queue.put(message["bytes"])
-            elif "text" in message:
-                data = json.loads(message["text"])
-                msg_type = data.get("type")
-
-                if msg_type == "set_speed":
-                    new_rate = data.get("rate")
-                    allowed_rates = ["+0.00%", "+11.50%", "+20.00%", "+50.00%", "+100.00%"]
-                    if new_rate in allowed_rates:
-                        speech_rate = new_rate
-                        logger.info(f"Client set speech rate to: {speech_rate}")
-
-                elif msg_type == "skip_to_quiz":
-                    logger.info(">>> Developer command: Skipping to quiz.")
-                    response_text = "Okay, skipping directly to the quiz."
-                    await websocket.send_json({"type": "ai_response", "text": response_text})
-                    # We transition the state and let the tts_finished handler do the rest
-                    await transition_to_state(AppState.QUIZ_START)
-                    await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-
-                elif msg_type == "control":
-                    command = data.get("command")
-                    if command == "start_speech":
-                        if audio_input_queue is None:
-                            audio_input_queue = asyncio.Queue()
-                            stt_results_queue = asyncio.Queue()
-                            session_id = f"{websocket.client.host}-{websocket.client.port}-{time.time()}"
-                            dialogflow_session_path = dialogflow_sessions_client.session_path(
-                                settings.GOOGLE_CLOUD_PROJECT_ID, session_id
-                            )
-                            asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
-
-                            async def result_handler():
-                                transcript = await stt_results_queue.get()
-                                if transcript:
-                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, speech_rate)
-                                else:
-                                    reprompt_text = "I didn't catch that. Could you please say it again?"
-                                    await websocket.send_json({"type": "ai_response", "text": reprompt_text})
-                                    await stream_azure_tts_and_send_to_client(reprompt_text, websocket, speech_rate)
-                            asyncio.create_task(result_handler())
-
-                    elif command == "end_speech":
-                        if audio_input_queue:
-                            await audio_input_queue.put(None)
-                            audio_input_queue = None
-                    elif command == "tts_finished":
-                        if current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]:
-                            await advance_lesson()
-                        # --- triggers the first quiz question ---
-                        elif current_state == AppState.QUIZ_START:
-                            await advance_quiz()
-                        elif current_state == AppState.QUIZ_FEEDBACK:
-                            await advance_quiz()
-                
-                # --- increments the score ---
-                elif msg_type == "quiz_answer":
-                    answer = data.get("answer")
-                    question_data = quiz_questions[quiz_step - 1]
-                    is_correct = (answer == question_data['correct_answer'])
-                    explanation = question_data.get("explanation", "That's one of the key rules to remember.")
-                    if is_correct:
-                        quiz_score += 1 # Increment score on correct answer
-                        feedback = "Correct!"
-                    else:
-                        feedback = f"Not quite. The correct answer was {question_data['correct_answer']}. Because: {explanation}"
-                    
-                    await transition_to_state(AppState.QUIZ_FEEDBACK)
-                    await websocket.send_json({"type": "ai_response", "text": feedback})
-                    await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
-
-    except WebSocketDisconnect:
-        logger.info("Client disconnected.")
-    except Exception as e:
-        logger.error(f"Error in websocket endpoint: {e}", exc_info=True)
-    finally:
-        logger.info("WebSocket connection closed.")
 
 # --- Helper Functions ---
 def extract_name(transcript: str) -> str:
@@ -982,89 +1308,6 @@ def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_nam
     cost = ((prompt_tokens / 1000) * PRICING[model_name]["prompt"]) + ((completion_tokens / 1000) * PRICING[model_name]["completion"]) if model_name in PRICING else 0
     logger.info(f"--- RAG Cost --- Tokens: {prompt_tokens}p + {completion_tokens}c = {prompt_tokens + completion_tokens}t | Est. Cost: ${cost:.6f}")
 
-async def get_dialogflow_response(transcript_text: str, session_path: str):
-    text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
-    query_input = dialogflow.QueryInput(text=text_input)
-    try:
-        response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
-        return response.query_result
-    except GoogleAPIError as e:
-        logger.error(f"Dialogflow API error: {e}")
-        return f"Dialogflow Error: {e}"
-
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, speech_rate: str):
-    await websocket.send_json({"type": "user_transcript", "text": transcript})
-
-    if current_state == AppState.INTRODUCTION:
-        user_name = extract_name(transcript)
-        response_text = f"It's nice to meet you, {user_name}! Let's get started."
-        await websocket.send_json({"type": "ai_response", "text": response_text})
-        await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-        await transition_func(AppState.LESSON_PROLOGUE)
-
-    elif current_state == AppState.LESSON_QUESTION:
-        step_data = lesson_flow[lesson_step - 1]
-        feedback = step_data['feedback_correct'] if step_data['correct_answer'].lower() in transcript.lower() else step_data['feedback_incorrect']
-        await transition_func(AppState.LESSON_FEEDBACK)
-        await websocket.send_json({"type": "ai_response", "text": feedback})
-        await stream_azure_tts_and_send_to_client(feedback, websocket, speech_rate)
-
-    # --- THIS IS THE NEW, ROBUST LOGIC BLOCK ---
-    elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
-        dialogflow_result = await get_dialogflow_response(transcript, session_path)
-        intent_name = dialogflow_result.intent.display_name if dialogflow_result else ""
-
-        # --- CLEAN 3-WAY LOGIC BRANCH ---
-
-        # 1. Did the user say NO?
-        if intent_name == 'DenyFollowup':
-            # If they say no during the lesson's specific Q&A point, advance the lesson.
-            if current_state == AppState.LESSON_QNA:
-                await advance_lesson_func()
-            else:
-                # If they say no during general Q&A, give a polite closing remark.
-                response_text = "Sounds good! Let's get started with the quiz."
-                await websocket.send_json({"type": "ai_response", "text": response_text})
-                await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-                # Transition to a final, general QNA state.
-                await transition_func(AppState.QUIZ_START)
-
-        # 2. Did the user say YES (without asking the question)?
-        elif intent_name == 'ConfirmQuestion':
-            # Prompt them for the actual question.
-            response_text = "Great, what is your question?"
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            # Ensure we are in the general QNA state to await the answer.
-            await transition_func(AppState.QNA)
-
-        # 3. If it's not a clear "no" or "yes", it must be THE QUESTION.
-        else:
-            # Get the answer from the RAG system.
-            rag_answer = await get_rag_response(transcript, session_path)
-            # Combine the answer with the follow-up.
-            response_text = f"{rag_answer} Do you have any other questions?"
-            
-            # Send the combined text and audio.
-            await websocket.send_json({"type": "ai_response", "text": response_text})
-            await stream_azure_tts_and_send_to_client(response_text, websocket, speech_rate)
-            # Stay in the general QNA state for the next turn.
-            await transition_func(AppState.QNA)
-
-async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
-    logger.info(f"Handling Q&A for: '{transcript_text}'")
-    if not transcript_text.strip(): return "I didn't catch that. Please repeat."
-
-    dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
-    if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
-        return dialogflow_response.fulfillment_text
-
-    if not retrieval_chain: return "My document search system isn't configured."
-    logger.info("Falling back to RAG system.")
-    usage_callback = UsageCallback()
-    rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
-    log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
-    return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
 
 async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
     sync_bridge_queue = queue.Queue()
@@ -1098,23 +1341,23 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
     await stt_thread
 
 async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, rate: str):
-    """
-    Generates TTS audio using a DYNAMIC speech rate provided as an argument.
-    """
     if not speech_config or not text:
         logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
         return
 
     escaped_text = text.replace("&", "&").replace("<", "<").replace(">", ">")
 
-    # --- MODIFIED: The 'rate' attribute now uses the function's 'rate' parameter ---
+    style = "cheerful"  # You can also try "empathetic" or "friendly"
+    #rate = "+7.50%"
     ssml_text = f"""
     <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
         <voice name="{speech_config.speech_synthesis_voice_name}">
-            <prosody rate="{rate}" pitch="-3%">
-                {escaped_text}
-                <mstts:silence type="Tailing" value="200ms"/>
-            </prosody>
+            <mstts:express-as style="{style}">
+                <prosody rate="{rate}" pitch="-3%">
+                    {escaped_text}
+                </prosody>
+            </mstts:express-as>
+            <mstts:silence type="Tailing" value="150ms"/>
         </voice>
     </speak>
     """
@@ -1123,52 +1366,27 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, r
     synthesis_complete_future = loop.create_future()
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
 
-    async def safe_send_bytes(data: bytes):
+    async def safe_send(data, send_func):
         try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_bytes(data)
-        except (WebSocketDisconnect, ConnectionClosed):
-            logger.warning("WebSocket disconnected during TTS audio streaming.")
-            if not synthesis_complete_future.done():
-                synthesis_complete_future.set_result(False)
+            if websocket.client_state == WebSocketState.CONNECTED: await send_func(data)
+        except (WebSocketDisconnect, ConnectionClosed) as e:
+            logger.warning(f"WebSocket disconnected during TTS streaming: {e}")
+            if not synthesis_complete_future.done(): synthesis_complete_future.set_result(False)
 
-    async def safe_send_json(data: dict):
-        try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json(data)
-        except (WebSocketDisconnect, ConnectionClosed):
-            logger.warning("WebSocket disconnected during TTS viseme streaming.")
-            if not synthesis_complete_future.done():
-                synthesis_complete_future.set_result(False)
-
-    def audio_chunk_handler(evt: speechsdk.SpeechSynthesisEventArgs):
-        asyncio.run_coroutine_threadsafe(safe_send_bytes(evt.result.audio_data), loop)
-
-    def viseme_handler(evt: speechsdk.SpeechSynthesisVisemeEventArgs):
-        viseme_data = {"type": "viseme", "offset_ms": evt.audio_offset / 10000, "viseme_id": evt.viseme_id}
-        asyncio.run_coroutine_threadsafe(safe_send_json(viseme_data), loop)
-    
-    def synthesis_complete_handler(evt: speechsdk.SpeechSynthesisEventArgs):
-        reason = evt.result.reason
-        if reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-            asyncio.run_coroutine_threadsafe(safe_send_json({"type": "tts_stream_finished"}), loop)
-        elif reason != speechsdk.ResultReason.Canceled:
+    synthesizer.synthesizing.connect(lambda evt: asyncio.run_coroutine_threadsafe(safe_send(evt.result.audio_data, websocket.send_bytes), loop))
+    synthesizer.viseme_received.connect(lambda evt: asyncio.run_coroutine_threadsafe(safe_send({"type": "viseme", "offset_ms": evt.audio_offset / 10000, "viseme_id": evt.viseme_id}, websocket.send_json), loop))
+    def synthesis_ended(evt):
+        if evt.result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted: asyncio.run_coroutine_threadsafe(safe_send({"type": "tts_stream_finished"}, websocket.send_json), loop)
+        elif evt.result.reason != speechsdk.ResultReason.Canceled:
             cancellation = speechsdk.SpeechSynthesisCancellationDetails.from_result(evt.result)
             logger.error(f"Azure TTS Error: Reason={cancellation.reason}, Details={cancellation.error_details}")
-        
-        if not synthesis_complete_future.done():
-            synthesis_complete_future.set_result(True)
-
-    synthesizer.synthesizing.connect(audio_chunk_handler)
-    synthesizer.viseme_received.connect(viseme_handler)
-    synthesizer.synthesis_completed.connect(synthesis_complete_handler)
-    synthesizer.synthesis_canceled.connect(synthesis_complete_handler)
+        if not synthesis_complete_future.done(): synthesis_complete_future.set_result(True)
     
+    synthesizer.synthesis_completed.connect(synthesis_ended)
+    synthesizer.synthesis_canceled.connect(synthesis_ended)
     synthesizer.start_speaking_ssml_async(ssml_text)
-    
     await synthesis_complete_future
-
-    synthesizer.synthesizing.disconnect_all()
-    synthesizer.viseme_received.disconnect_all()
     synthesizer.synthesis_completed.disconnect_all()
     synthesizer.synthesis_canceled.disconnect_all()
+    synthesizer.viseme_received.disconnect_all()
+    synthesizer.synthesizing.disconnect_all()
