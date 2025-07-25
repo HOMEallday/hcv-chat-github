@@ -29,8 +29,10 @@ from pydantic import BaseModel
 import vertexai
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
-
+from vertexai.generative_models import GenerativeModel
 from config import settings
+import langchain
+langchain.debug = True
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +42,6 @@ logger = logging.getLogger(__name__)
 speech_client = None
 speech_config = None
 dialogflow_sessions_client = None
-retrieval_chain = None
-gemini_llm: Optional[ChatVertexAI] = None
 
 # --- Application State Enum ---
 class AppState(Enum):
@@ -177,7 +177,7 @@ lessons = {
         "flow": [
             {
                 "type": "lecture",
-                "text": "Welcome to Lesson 2. This lesson is currently under development."
+                "text": "lesson is currently under development."
             },
             {
                 "type": "qna_prompt",
@@ -298,61 +298,45 @@ class UsageCallback(BaseCallbackHandler):
 # --- FastAPI Lifespan Manager (for startup and shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global speech_client, speech_config, dialogflow_sessions_client, retrieval_chain, gemini_llm
+    global speech_client, speech_config, dialogflow_sessions_client
     logger.info("--- Application Startup Initiated ---")
     try:
         # Initialize clients
         speech_client = speech.SpeechClient()
         dialogflow_sessions_client = dialogflow.SessionsAsyncClient()
         vertexai.init(project=settings.GOOGLE_CLOUD_PROJECT_ID)
-
         logger.info(f"Google clients initialized successfully for project: {settings.GOOGLE_CLOUD_PROJECT_ID}")
 
+        # Configure Azure Speech
         try:
             speech_config = speechsdk.SpeechConfig(
-                subscription=settings.AZURE_SPEECH_KEY, 
-                region=settings.AZURE_SPEECH_REGION
+                subscription=settings.AZURE_SPEECH_KEY, region=settings.AZURE_SPEECH_REGION
             )
-
             speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
-            # Set the output format. MP3 is widely compatible.
             speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
             logger.info("Azure Speech Service configured successfully.")
         except Exception as e:
             logger.error(f"!!! FAILED to configure Azure Speech Service: {e} !!!")
             speech_config = None
 
-        gemini_llm = ChatVertexAI(
-            model_name="gemini-2.5-flash",
-            temperature=0.2,
-        )
-        embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
+        # --- CORRECTED RAG SETUP ---
+        # 1. Initialize LLM and Embeddings
+        llm = GenerativeModel("gemini-2.5-flash")
+        embeddings = VertexAIEmbeddings(model_name="text-embedding-005") # Using a recent, stable version
 
-        # Load ChromaDB
-        chroma_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'chroma_db')
+        # 2. Set default states
+        app.state.retriever = None
+        app.state.llm = llm
+
+        # 3. Load ChromaDB and create the retriever
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        chroma_db_path = os.path.join(base_dir, '..', 'data', 'chroma_db')
+        
         if os.path.exists(chroma_db_path):
             vectorstore = Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
-
-            # Build RAG chain
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
-            rag_prompt = ChatPromptTemplate.from_template("""
-You are an AI assistant for housing policies. Provide EXTREMELY concise, one-paragraph summaries.
-CRITICAL INSTRUCTIONS:
-- Your response MUST be a single, short paragraph.
-- You MUST NOT use any markdown formatting.
-- If the context does not contain the answer, ONLY say "I don't have enough information to answer that."
-- Get straight to the point.
-
-CONTEXT:
-{context}
-
-QUESTION:
-{input}
-""")
-
-            document_chain = create_stuff_documents_chain(gemini_llm, rag_prompt)
-            retrieval_chain = create_retrieval_chain(retriever, document_chain)
-            logger.info(">>> RAG chain built successfully.")
+            # 4. Correctly store the retriever in the app's state
+            app.state.retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+            logger.info(">>> Retriever and LLM initialized successfully.")
         else:
             logger.error(f"Chroma DB not found at {chroma_db_path}. RAG will be unavailable.")
 
@@ -707,6 +691,28 @@ html = """
                 returnBtn.onclick = () => window.location.reload();
                 quizOptionsDiv.appendChild(returnBtn);
             }
+            else if (message.type === 'rag_start') {
+                // Create a new empty message bubble that we can add to.
+                const messageElem = document.createElement('div');
+                messageElem.classList.add('message', 'ai-message', 'streaming-message');
+                conversationDiv.appendChild(messageElem);
+                conversationDiv.scrollTop = conversationDiv.scrollHeight;
+            }
+            else if (message.type === 'rag_chunk') {
+                // Find the streaming bubble and append the new text.
+                const streamingMessage = document.querySelector('.streaming-message');
+                if (streamingMessage) {
+                    streamingMessage.innerHTML += message.text.replace(/\\n/g, '<br>');
+                    conversationDiv.scrollTop = conversationDiv.scrollHeight;
+                }
+            }
+            else if (message.type === 'rag_end') {
+                // Find the bubble and remove the special class so we're ready for the next stream.
+                const streamingMessage = document.querySelector('.streaming-message');
+                if (streamingMessage) {
+                    streamingMessage.classList.remove('streaming-message');
+                }
+            }
         }
 
         function displayQuizOptions(options) {
@@ -756,10 +762,40 @@ html = """
 </body>
 </html>
 """
+# REPLACE your existing StreamingAsyncCallbackHandler with this one
+
+class StreamingAsyncCallbackHandler(BaseCallbackHandler):
+    """Callback handler for streaming LLM responses to a WebSocket."""
+
+    def __init__(self, websocket: WebSocket):
+        super().__init__()
+        self.websocket = websocket
+        self.full_response = ""
+
+    async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs: Any) -> None:
+        """Log when the LLM starts and send a start message."""
+        logger.info("--- LLM Streaming Started ---")
+        await self.websocket.send_json({"type": "rag_start"})
+
+    async def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        """Log and stream every new token."""
+        logger.info(f"LLM New Token: '{token}'")
+        self.full_response += token
+        await self.websocket.send_json({"type": "rag_chunk", "text": token})
+
+    async def on_llm_end(self, response, **kwargs: Any) -> None:
+        """Log the raw response and send an end message."""
+        logger.info("--- LLM Streaming Ended ---")
+        
+        # This will print the detailed response object from the provider
+        logger.info(f"Raw LLM Response: {response}") 
+        
+        await self.websocket.send_json({"type": "rag_end"})
+        logger.info(f"Callback stream finished. Full response: {self.full_response}")
 
 # --- Main Endpoints ---
 class ConnectionManager:
-    def __init__(self, websocket: WebSocket):
+    def __init__(self, websocket: WebSocket, retriever: Any, llm: Any):
         self.websocket = websocket
         self.current_state = AppState.IDLE
         self.speech_rate = "+11.50%"
@@ -774,6 +810,9 @@ class ConnectionManager:
         self.user_name: Optional[str] = None
         self.speech_processing_task: Optional[asyncio.Task] = None
         self.tts_completion_event: Optional[asyncio.Event] = None
+        self.retriever = retriever
+        self.llm = llm
+        self.sentence_delimiters = re.compile(r'(?<=[.!?])\s+')
 
     async def _get_dialogflow_response(self, transcript_text: str):
         session_path = self.dialogflow_session_path
@@ -785,23 +824,195 @@ class ConnectionManager:
         except GoogleAPIError as e:
             logger.error(f"Dialogflow API error: {e}")
             return f"Dialogflow Error: {e}"
+    async def tts_task_manager(self, tts_queue: asyncio.Queue):
+        while True:
+            # Wait for a sentence to be put into the queue.
+            sentence = await tts_queue.get()
+            
+            if sentence is None:
+                # A 'None' is our signal that the stream is finished.
+                break
+                
+            logger.info(f"[TTS Manager] Now speaking sentence: '{sentence}'")
+            # Generate and stream the audio for this single sentence.
+            await stream_azure_tts_and_send_to_client(sentence, self.websocket, self.speech_rate)
 
-    async def _get_rag_response(self, transcript_text: str, dialogflow_response: Any) -> str:
-        start_time = time.monotonic()
-        logger.info("[TIMER] RAG Query task STARTED.")
-        if not transcript_text.strip(): return "I didn't catch that. Please repeat."
+        logger.info("[TTS Manager] Finished processing all sentences.")
+    async def run(self):
+        """The main loop to handle incoming WebSocket messages."""
+        await self.transition_to_state(AppState.IDLE)
+        try:
+            # Loop continuously while the connection is open
+            while self.websocket.client_state == WebSocketState.CONNECTED:
+                message = await self.websocket.receive()
+                
+                # Handle incoming audio bytes
+                if "bytes" in message:
+                    if self.audio_input_queue:
+                        await self.audio_input_queue.put(message["bytes"])
+                
+                # Handle incoming text messages (JSON)
+                elif "text" in message:
+                    await self.handle_text_message(json.loads(message["text"]))
 
-        if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
-            return dialogflow_response.fulfillment_text
+        except WebSocketDisconnect:
+            logger.info("Client disconnected.")
+        except Exception as e:
+            logger.error(f"Error in ConnectionManager run loop: {e}", exc_info=True)
+        finally:
+            logger.info("WebSocket connection closed.")
+    # The final, correct version of your streaming function
+    # In your ConnectionManager class, REPLACE the old function with this one
 
-        if not retrieval_chain: return "My document search system isn't configured."
-        usage_callback = UsageCallback()
-        rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
-        log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
-        end_time = time.monotonic()
-        duration = end_time - start_time
-        logger.info(f"[TIMER] RAG Query task FINISHED. Duration: {duration:.2f} seconds.")
-        return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
+    async def _get_rag_response_and_stream_audio(self, transcript_text: str):
+        overall_start_time = time.monotonic()
+        logger.info(f"[TIMER] TRUE STREAM RAG STARTED for: '{transcript_text}'")
+
+        if not self.retriever or not self.llm:
+            await self.speak("My document search system isn't configured.", AppState.QNA)
+            return
+
+        # --- 1. Document Retrieval ---
+        retrieval_start_time = time.monotonic()
+        retrieved_docs = await self.retriever.ainvoke(transcript_text)
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        retrieval_duration = time.monotonic() - retrieval_start_time
+        logger.info(f"[TIMER] Document Retrieval FINISHED in {retrieval_duration:.2f} seconds.")
+        
+        prompt_string = f"""
+You are an AI assistant for housing policies. Use the following context to answer the user's question.
+- Synthesize the context into a concise answer.[one or two sentences]
+- If the context does not contain relevant information, state that you cannot find the answer in the provided documents.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{transcript_text}
+"""
+        
+        token_queue = asyncio.Queue()
+        tts_sentence_queue = asyncio.Queue()
+        
+        def producer(loop, t_queue):
+            """
+            (Instrumented for Debugging)
+            Synchronous function that iterates over the Google stream, LOGS EVERY
+            TOKEN, and puts each token into the asyncio queue.
+            """
+            try:
+                logger.info("[PRODUCER] Starting Google stream... Waiting for first byte from API.")
+                responses = self.llm.generate_content(prompt_string, stream=True)
+                
+                # --- Start of new logging instrumentation ---
+                last_token_time = time.monotonic()
+                token_count = 0
+                logger.info("==================== TOKEN STREAM START ====================")
+                # --- End of new logging instrumentation ---
+
+                for chunk in responses:
+                    if chunk.text:
+                        # --- Logging each and every token ---
+                        now = time.monotonic()
+                        delta = now - last_token_time
+                        token_count += 1
+                        logger.info(f"[PRODUCER-STREAM] Token #{token_count:03d} | ΔT: {delta:.4f}s | Content: '{chunk.text}'")
+                        last_token_time = now
+                        # --- End of token logging ---
+
+                        loop.call_soon_threadsafe(t_queue.put_nowait, chunk.text)
+            finally:
+                logger.info("==================== TOKEN STREAM END ======================")
+                # Signal the end of the stream
+                loop.call_soon_threadsafe(t_queue.put_nowait, None)
+            logger.info("[PRODUCER] Google stream finished. Producer thread is closing.")
+
+        # --- 4. The Consumer (no changes needed here) ---
+        async def consumer():
+            """
+            Asynchronous function that gets tokens from the queue as they arrive,
+            sends them to the client, and forms/queues sentences for TTS.
+            """
+            await self.websocket.send_json({"type": "rag_start"})
+            full_response_text = ""
+            current_sentence = ""
+            first_token_received = False
+            
+            tts_manager_task = asyncio.create_task(self.tts_task_manager(tts_sentence_queue))
+
+            while True:
+                token = await token_queue.get()
+                if token is None:
+                    break
+
+                if not first_token_received:
+                    time_to_first_token = time.monotonic() - overall_start_time
+                    logger.info(f"[TIMER] Time to First Token: {time_to_first_token:.2f} seconds.")
+                    first_token_received = True
+
+                await self.websocket.send_json({"type": "rag_chunk", "text": token})
+                
+                full_response_text += token
+                current_sentence += token
+
+                parts = self.sentence_delimiters.split(current_sentence)
+                if len(parts) > 1:
+                    for sentence_part in parts[:-1]:
+                        if sentence_part.strip():
+                            await tts_sentence_queue.put(sentence_part.strip())
+                    current_sentence = parts[-1]
+
+            if current_sentence.strip():
+                await tts_sentence_queue.put(current_sentence.strip())
+            
+            await tts_sentence_queue.put(None)
+            await tts_manager_task
+            
+            await self.websocket.send_json({"type": "rag_end"})
+            logger.info(f"Full RAG Response: {full_response_text}")
+            overall_duration = time.monotonic() - overall_start_time
+            logger.info(f"[TIMER] TRUE STREAM RAG FINISHED in {overall_duration:.2f} seconds.")
+            
+            await self.speak("Do you have any other questions?", AppState.QNA)
+
+        # --- 5. Start the producer and run the consumer (with arguments) ---
+        loop = asyncio.get_running_loop()
+        # Pass the loop and queue as arguments to the producer
+        loop.run_in_executor(None, producer, loop, token_queue)
+        await consumer()
+
+
+
+    async def tts_task_manager(self, tts_queue: asyncio.Queue):
+        """
+        (FINAL) Pulls sentences from a queue, plays their audio, and waits
+        for client confirmation before playing the next one.
+        """
+        while True:
+            sentence = await tts_queue.get()
+            if sentence is None:
+                break
+                
+            logger.info(f"[TTS Manager] Now speaking sentence: '{sentence}'")
+            
+            # 1. Create a new event for this specific sentence.
+            self.tts_completion_event = asyncio.Event()
+            
+            # 2. Start the TTS generation. This is non-blocking.
+            await stream_azure_tts_and_send_to_client(sentence, self.websocket, self.speech_rate)
+            
+            # 3. Wait for the `tts_finished` signal from the client for this sentence.
+            logger.info("[TTS Manager] Waiting for client confirmation...")
+            try:
+                await asyncio.wait_for(self.tts_completion_event.wait(), timeout=20.0)
+                logger.info("[TTS Manager] Client confirmed sentence finished.")
+            except asyncio.TimeoutError:
+                logger.warning("[TTS Manager] Timed out waiting for client confirmation.")
+            finally:
+                self.tts_completion_event = None
+
+        logger.info("[TTS Manager] Finished processing all sentences.")
+
 
     async def transition_to_state(self, new_state: AppState):
         self.current_state = new_state
@@ -809,16 +1020,42 @@ class ConnectionManager:
         await self.websocket.send_json({"type": "state_update", "state": self.current_state.value})
 
     async def advance_lesson(self):
-        if self.lesson_step < len(self.current_lesson_flow):
+        """
+        Main lesson advancement logic. This function now loops through consecutive
+        lecture steps automatically, only stopping when user input is required.
+        """
+        logger.info("[ADVANCE_LESSON] Entering lesson advancement loop...")
+
+        # Loop as long as there are steps left in the lesson.
+        while self.lesson_step < len(self.current_lesson_flow):
             step_data = self.current_lesson_flow[self.lesson_step]
-            self.lesson_step += 1
             text = step_data["text"]
-            if step_data["type"] == "lecture": await self.transition_to_state(AppState.LESSON_DELIVERY)
-            elif step_data["type"] == "question": await self.transition_to_state(AppState.LESSON_QUESTION)
-            elif step_data["type"] == "qna_prompt": await self.transition_to_state(AppState.LESSON_QNA)
-            await self.send_ai_response(text)
-        else:
-            await self.send_ai_response("Okay, let's start the final quiz.", AppState.QUIZ_START)
+            step_type = step_data["type"]
+
+            logger.info(f"[ADVANCE_LESSON] Processing step {self.lesson_step}, type: {step_type}")
+
+            # Check the type of the current step
+            if step_type == "lecture":
+                # For a lecture, we speak, wait for it to complete, and then loop again.
+                await self.speak(text, AppState.LESSON_DELIVERY)
+                await self._wait_for_tts_completion()
+                self.lesson_step += 1  # Move to the next step
+                continue  # Immediately continue to the next iteration of the loop
+            
+            elif step_type == "question" or step_type == "qna_prompt":
+                # For a question or prompt, we speak and then STOP.
+                # The system must wait for the user to respond.
+                next_state = AppState.LESSON_QUESTION if step_type == "question" else AppState.LESSON_QNA
+                await self.speak(text, next_state)
+                self.lesson_step += 1  # Increment step so we don't repeat it
+                logger.info("[ADVANCE_LESSON] Pausing for user input.")
+                return  # EXIT the function here.
+
+        # If the while loop completes, it means all steps are done.
+        logger.info("[ADVANCE_LESSON] Lesson flow finished. Starting quiz.")
+        await self.speak("Okay, let's start the final quiz.", AppState.QUIZ_START)
+        await self._wait_for_tts_completion()
+        await self.advance_quiz()
 
     async def advance_quiz(self):
         if self.quiz_step < len(self.current_quiz_questions):
@@ -834,11 +1071,39 @@ class ConnectionManager:
             await self.websocket.send_json({"type": "quiz_summary", "text": summary, "lesson_id": self.selected_lesson_id})
             await stream_azure_tts_and_send_to_client(summary, self.websocket, self.speech_rate)
 
-    async def send_ai_response(self, text: str, next_state: Optional[AppState] = None):
+    async def speak(self, text: str, next_state: Optional[AppState] = None):
+        """
+        (Fire-and-Forget) Sends text to the client and starts the TTS stream.
+        Does NOT wait for completion.
+        """
+        logger.info(f"[SPEAK] Sending text: '{text}' and transitioning to state: {next_state.value if next_state else 'None'}")
         if next_state:
             await self.transition_to_state(next_state)
+        
+        # Send the text to be displayed in the chat bubble
         await self.websocket.send_json({"type": "ai_response", "text": text})
-        await stream_azure_tts_and_send_to_client(text, self.websocket, self.speech_rate)
+        
+        # Start the TTS audio stream in the background
+        asyncio.create_task(stream_azure_tts_and_send_to_client(text, self.websocket, self.speech_rate))
+        logger.info(f"[SPEAK] TTS stream started for: '{text}'")
+
+    async def _wait_for_tts_completion(self):
+        """
+        Creates and waits for a TTS completion event from the client.
+        This is now the ONLY place where we wait for this specific event.
+        """
+        try:
+            # Create a new, unique event for this specific wait period
+            self.tts_completion_event = asyncio.Event()
+            logger.info("[WAIT] Now waiting for 'tts_finished' signal from client...")
+            # Wait for the event to be set, with a generous timeout
+            await asyncio.wait_for(self.tts_completion_event.wait(), timeout=60.0)
+            logger.info("[WAIT] 'tts_finished' signal received. Wait complete.")
+        except asyncio.TimeoutError:
+            logger.warning("[WAIT] Timed out waiting for 'tts_finished' signal.")
+        finally:
+            # Clean up the event so we don't accidentally re-use it
+            self.tts_completion_event = None
 
     async def _send_thinking_and_wait(self):
         start_time = time.monotonic()
@@ -868,47 +1133,72 @@ class ConnectionManager:
 
     async def handle_user_transcript(self, transcript: str):
         await self.websocket.send_json({"type": "user_transcript", "text": transcript})
-        if self.current_state == AppState.INTRODUCTION:
-            user_name = extract_name(transcript)
-            self.user_name = user_name
+        # Launch the logic handler as a non-blocking background task.
+        asyncio.create_task(self.handle_transcript_logic(transcript))
+
+    async def handle_quiz_answer_logic(self, data: dict):
+        """Handles the logic for a submitted quiz answer."""
+        question_data = self.current_quiz_questions[self.quiz_step - 1]
+        is_correct = data.get("answer") == question_data['correct_answer']
+        
+        if is_correct:
+            self.quiz_score += 1
+            feedback = "Correct!"
+        else:
+            feedback = f"Not quite. The correct answer was {question_data['correct_answer']}."
+
+        await self.speak(feedback, AppState.QUIZ_FEEDBACK)
+        await self._wait_for_tts_completion()
+        await self.advance_quiz()
+
+    async def handle_transcript_logic(self, transcript: str):
+        """Contains the actual logic for processing a user's speech."""
+        current_state = self.current_state
+        logger.info(f"Handling transcript logic in state '{current_state.value}': '{transcript}'")
+
+        if current_state == AppState.INTRODUCTION:
+            self.user_name = extract_name(transcript) or "there"
             await self.websocket.send_json({"type": "user_identity_set", "name": self.user_name})
-            await self.send_ai_response(f"It's nice to meet you, {user_name}! Let's get started.", AppState.LESSON_PROLOGUE)
-        elif self.current_state == AppState.LESSON_QUESTION:
+            
+            await self.speak(f"It's nice to meet you, {self.user_name}! Let's get started.", AppState.LESSON_PROLOGUE)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+        
+        elif current_state == AppState.LESSON_QUESTION:
             step_data = self.current_lesson_flow[self.lesson_step - 1]
             user_answer_lower = transcript.lower()
-            correct_answers = step_data['correct_answer'].split(',')
-            is_correct = any(answer.strip().lower() in user_answer_lower for answer in correct_answers)           
+            correct_answers = [ans.strip().lower() for ans in str(step_data['correct_answer']).split(',')]
+            is_correct = any(answer in user_answer_lower for answer in correct_answers)
+            
             feedback = step_data['feedback_correct'] if is_correct else step_data['feedback_incorrect']
-            await self.send_ai_response(feedback, AppState.LESSON_FEEDBACK)
-
-        elif self.current_state in [AppState.LESSON_QNA, AppState.QNA]: #maybe add Quiz_complete here too
-            dialogflow_result = await self._get_dialogflow_response(transcript)
-            intent_name = dialogflow_result.intent.display_name if dialogflow_result and hasattr(dialogflow_result, 'intent') else ""
-
-            if intent_name == 'DenyFollowup':
-                response_text = "Sounds good! Let's get started with the quiz."
-                logger.info("User denied follow-up. Advancing lesson.")
-                await self.advance_lesson()
-
-            elif intent_name == 'ConfirmQuestion':
-                logger.info("User confirmed they have a question. Prompting for it.")
-                await self.send_ai_response("Great, what is your question?", AppState.QNA)
-
-            else:
-                logger.info("No clear intent matched. Falling back to RAG.")
-                overall_start_time = time.monotonic()
             
-                logger.info("[TIMER] Kicking off both RAG and 'Thinking' tasks concurrently...")
-                rag_task = asyncio.create_task(self._get_rag_response(transcript, dialogflow_result))
-                thinking_and_waiting_task = asyncio.create_task(self._send_thinking_and_wait())
-                results = await asyncio.gather(rag_task, thinking_and_waiting_task)
-                overall_end_time = time.monotonic()
-                overall_duration = overall_end_time - overall_start_time
-                logger.info(f"[TIMER] `asyncio.gather` has completed. Total concurrent wait time: {overall_duration:.2f} seconds.")
-                rag_answer = results[0]
-                response_text = f"{rag_answer} Do you have any other questions?"
-                await self.send_ai_response(response_text, AppState.QNA)
-            
+            await self.speak(feedback, AppState.LESSON_FEEDBACK)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+
+        elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
+            # This function is already fully async and handles its own streaming, so it's safe to call directly.
+            await self._get_rag_response_and_stream_audio(transcript)
+
+    async def _start_lesson_logic(self):
+        """
+        This is the main, non-blocking logic flow for starting and advancing a lesson.
+        It runs as a separate task so it doesn't block the main message-receiving loop.
+        """
+        logger.info("[LOGIC_TASK] Starting lesson logic...")
+
+        # Determine if it's a new or returning user to decide the greeting.
+        if self.user_name:
+            # Returning user
+            response_text = f"Welcome back, {self.user_name}! Let's begin Lesson {self.selected_lesson_id}."
+            await self.speak(response_text, AppState.LESSON_PROLOGUE)
+            await self._wait_for_tts_completion()
+            await self.advance_lesson()
+        else:
+            # New user: just ask for their name. The logic will be picked up
+            # by handle_user_transcript after they speak.
+            await self.speak("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)  
+
     async def process_speech_result(self, stt_results_queue: asyncio.Queue):
         try:
             transcript = await stt_results_queue.get()
@@ -927,24 +1217,21 @@ class ConnectionManager:
 
     async def handle_text_message(self, data: dict):
         msg_type = data.get("type")
+        logger.info(f"Received WebSocket message of type: {msg_type}")
         if msg_type == "select_lesson":
             lesson_id = data.get("lesson_id")
             saved_user_name = data.get("user_name") 
             if lesson_id and lesson_id in lessons:
+                # 1. Set up all the state variables for the new lesson.
                 self.selected_lesson_id = lesson_id
                 self.current_lesson_flow = lessons[lesson_id]["flow"]
                 self.current_quiz_questions = lessons[lesson_id]["quiz"]
-                self.lesson_step = 0
-                self.quiz_step = 0
-                self.quiz_score = 0
-                logger.info(f"Client selected Lesson {lesson_id}: {lessons[lesson_id]['title']}")
-
-                if saved_user_name:
-                    self.user_name = saved_user_name
-                    response_text = f"Welcome back, {self.user_name}! Let's begin Lesson {lesson_id}."
-                    await self.send_ai_response(response_text, AppState.LESSON_PROLOGUE)
-                else:
-                    await self.send_ai_response("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)
+                self.user_name = saved_user_name  # Can be None if it's a new user
+                self.lesson_step = 0; self.quiz_step = 0; self.quiz_score = 0
+                
+                # 2. Launch the main logic as a background task. DO NOT await it.
+                # This immediately frees the run() loop to listen for more messages.
+                asyncio.create_task(self._start_lesson_logic())
         elif msg_type == "set_speed":
             new_rate = data.get("rate")
             if new_rate:
@@ -964,26 +1251,12 @@ class ConnectionManager:
 
             elif command == "end_speech":
                 if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None
-            elif command == "tts_finished":
+            if command == "tts_finished":
                 if self.tts_completion_event and not self.tts_completion_event.is_set():
-                # This is the signal we were waiting for. Open the gate.
-                    logger.info("Received `tts_finished` signal, setting completion event.")
+                    logger.info("Signal received. Setting tts_completion_event.")
                     self.tts_completion_event.set()
-                    return
-                if self.current_state in [AppState.LESSON_PROLOGUE, AppState.LESSON_DELIVERY, AppState.LESSON_FEEDBACK]: await self.advance_lesson()
-                elif self.current_state in [AppState.QUIZ_START, AppState.QUIZ_FEEDBACK]: await self.advance_quiz()
-                elif self.current_state in [AppState.QNA, AppState.LESSON_QNA]:# and self.thinking_tts_done_event:
-                    #self.thinking_tts_done_event.set() 
-                    #self.thinking_tts_done_event = None
-                    pass
         elif msg_type == "quiz_answer":
-            question_data = self.current_quiz_questions[self.quiz_step - 1]
-            if data.get("answer") == question_data['correct_answer']:
-                self.quiz_score += 1
-                feedback = "Correct!"
-            else:
-                feedback = f"Not quite. The correct answer was {question_data['correct_answer']}. Because: {question_data.get('explanation', 'That is the correct rule.')}"
-            await self.send_ai_response(feedback, AppState.QUIZ_FEEDBACK)
+            asyncio.create_task(self.handle_quiz_answer_logic(data))
 
     async def run(self):
         await self.transition_to_state(AppState.IDLE)
@@ -1009,7 +1282,13 @@ async def get(): return HTMLResponse(html)
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established.")
-    manager = ConnectionManager(websocket)
+    retriever = websocket.app.state.retriever
+    llm = websocket.app.state.llm
+    if not retriever or not llm:
+        logger.error("Retriever or LLM not available. Closing connection.")
+        await websocket.close(code=1011, reason="Server configuration error.")
+        return
+    manager = ConnectionManager(websocket, retriever=retriever, llm=llm)
     await manager.run()
 
 
