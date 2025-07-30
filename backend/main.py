@@ -29,6 +29,11 @@ from langchain_chroma import Chroma
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from sentence_transformers import SentenceTransformer
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFacePipeline
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import Pinecone
 from pydantic import BaseModel
 import vertexai
 from starlette.websockets import WebSocketState, WebSocketDisconnect
@@ -46,6 +51,30 @@ async def get_api_key(api_key_from_header: str = Security(api_key_header)):
         return api_key_from_header
     else:
         raise HTTPException(status_code=403, detail="Could not validate credentials")
+
+def initialize_embeddings():
+    if settings.EMBEDDING_MODEL == "vertexai":
+        return VertexAIEmbeddings(model_name=settings.EMBEDDING_MODEL_NAME)
+    elif settings.EMBEDDING_MODEL == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings()
+    elif settings.EMBEDDING_MODEL == "sentence-transformers":
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL_NAME)
+    else:
+        raise ValueError("Unsupported embedding model")
+
+def initialize_llm(model_name: str = "gemini-2.5-flash"):
+    return GenerativeModel(model_name=model_name)
+
+def initialize_vector_store(chroma_db_path: str, embeddings):
+    if os.path.exists(chroma_db_path):
+        return Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
+    else:
+        raise FileNotFoundError(f"Chroma DB not found at {chroma_db_path}")
+    
+def initialize_retriever(vector_store, search_kwargs: dict = {"k": 2}):
+    return vector_store.as_retriever(search_kwargs=search_kwargs)
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -339,8 +368,8 @@ async def lifespan(app: FastAPI):
 
         # --- CORRECTED RAG SETUP ---
         # 1. Initialize LLM and Embeddings
-        llm = GenerativeModel("gemini-2.5-flash")
-        embeddings = VertexAIEmbeddings(model_name="text-embedding-005") # Using a recent, stable version
+        embeddings = initialize_embeddings()
+        llm = initialize_llm()
 
         # 2. Set default states
         app.state.retriever = None
@@ -350,13 +379,11 @@ async def lifespan(app: FastAPI):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         chroma_db_path = os.path.join(base_dir, '..', 'data', 'chroma_db')
         
-        if os.path.exists(chroma_db_path):
-            vectorstore = Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
-            # 4. Correctly store the retriever in the app's state
-            app.state.retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
-            logger.info(">>> Retriever and LLM initialized successfully.")
-        else:
-            logger.error(f"Chroma DB not found at {chroma_db_path}. RAG will be unavailable.")
+
+        vector_store = initialize_vector_store(chroma_db_path, embeddings)
+        app.state.retriever = initialize_retriever(vector_store)
+        logger.info(">>> Retriever and LLM initialized successfully.")
+
 
     except Exception as e:
         logger.error(f"!!! STARTUP FAILED !!! Error details: {e}", exc_info=True)
@@ -474,25 +501,18 @@ async def execute_rag_test(request: TestRequest, retriever: Any) -> Dict[str, An
         time_to_first_token = time.monotonic() - ttft_start
         
         full_response_text = ""
-        # --- DEFINITIVE LOGIC: Nested Try/Except block ---
         try:
-            # This is the line that can raise an exception.
             full_response_text = response.text
         except ValueError:
-            # This block is entered ONLY if accessing .text fails.
-            # We now check if it failed for the expected reason (MAX_TOKENS).
             if response.candidates and response.candidates[0].finish_reason.name == "MAX_TOKENS":
-                # This is a "successful" run for our performance test.
                 full_response_text = "[Truncated by MAX_TOKENS]"
             else:
-                # If it failed for another reason (e.g., SAFETY), re-raise the exception
-                # to be caught by the outer `except` block.
                 raise
         
         # If we get here, it's a success. Now, get usage data.
         usage = response.usage_metadata
         prompt_tokens = usage.prompt_token_count
-        completion_tokens = usage.candidates_token_count
+        completion_tokens = usage.total_token_count - usage.prompt_token_count
         total_tokens = usage.total_token_count
 
     except Exception as e:

@@ -98,7 +98,7 @@ def run_grid_search():
                     "error": str(e)
                 })
 
-            time.sleep(10)  # Increased sleep time slightly to be safe
+            time.sleep(2)  # Increased sleep time slightly to be safe
 
     # --- Print Final Summary Table ---
     print("\n\n========================= GRID SEARCH SUMMARY =========================")

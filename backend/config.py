@@ -26,6 +26,21 @@ class Settings(BaseSettings):
 
     PERFORMANCE_TEST_API_KEY: str
 
+    # RAG Model and Vector Store Configurations
+    EMBEDDING_MODEL: str = "vertexai"  # Options: "vertexai", "openai", "sentence-transformers"
+    EMBEDDING_MODEL_NAME: str = "text-embedding-005"  # Specific model name (e.g., "text-embedding-005", "all-MiniLM-L6-v2")
+
+    GENERATION_MODEL: str = "gemini-2.5-flash"  # Options: "gemini-2.5-flash", "gpt-4", "mistral"
+    GENERATION_MODEL_NAME: str = "gemini-2.5-flash"  # Specific model name (if needed)
+
+    VECTOR_STORE: str = "chroma"  # Options: "chroma", "pinecone", "faiss"
+    CHROMA_DB_PATH: str = "data/chroma_db"  # Path to Chroma DB (if using Chroma)
+    PINECONE_INDEX_NAME: Optional[str] = None  # Pinecone index name (if using Pinecone)
+
+
+
+
+
     # This tells Pydantic to read from the .env file.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
