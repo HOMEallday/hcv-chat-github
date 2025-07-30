@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     LANGCHAIN_API_KEY: Optional[str] = None
     LANGCHAIN_PROJECT: Optional[str] = None
 
+    PERFORMANCE_TEST_API_KEY: str
+
     # This tells Pydantic to read from the .env file.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

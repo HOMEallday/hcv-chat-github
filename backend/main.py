@@ -14,6 +14,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi import Security, HTTPException, Depends
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
+import statistics
 from google.api_core.exceptions import GoogleAPIError
 from google.cloud import dialogflow_v2 as dialogflow
 from google.cloud import speech_v1p1beta1 as speech
@@ -29,10 +33,19 @@ from pydantic import BaseModel
 import vertexai
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 from config import settings
 import langchain
-langchain.debug = True
+
+langchain.debug = False
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+async def get_api_key(api_key_from_header: str = Security(api_key_header)):
+    # Compare the header key to the key loaded from your .env file
+    if api_key_from_header == settings.PERFORMANCE_TEST_API_KEY:
+        return api_key_from_header
+    else:
+        raise HTTPException(status_code=403, detail="Could not validate credentials")
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +55,11 @@ logger = logging.getLogger(__name__)
 speech_client = None
 speech_config = None
 dialogflow_sessions_client = None
+
+class TestRequest(BaseModel):
+    model_name: str
+    prompt: str
+    max_output_tokens: int
 
 # --- Application State Enum ---
 class AppState(Enum):
@@ -405,6 +423,113 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
             fulfillment_text = "I ran into an error trying to calculate that."
 
     return JSONResponse(content={"fulfillmentText": fulfillment_text})
+
+
+async def execute_rag_test(request: TestRequest, retriever: Any) -> Dict[str, Any]:
+    """
+    Executes a single RAG test without streaming. Returns performance metrics.
+    """
+    start_time = time.monotonic()
+
+    try:
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        }
+        llm = GenerativeModel(request.model_name)
+    except Exception as e:
+        return {"error": f"Failed to initialize model {request.model_name}: {e}"}
+
+    retrieval_start = time.monotonic()
+    retrieved_docs = await retriever.ainvoke(request.prompt)
+    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    retrieval_time = time.monotonic() - retrieval_start
+
+    prompt_string = f"""
+    You are an expert AI assistant on housing policy. Use the provided context to answer the question.
+    If the context does not contain the answer, state that you cannot find the information in the documents.
+
+    CONTEXT:
+    ---
+    {context}
+    ---
+
+    QUESTION:
+    {request.prompt}
+    """
+
+    generation_config = {"max_output_tokens": request.max_output_tokens}
+    
+    ttft_start = time.monotonic()
+    try:
+        response = await asyncio.to_thread(
+            lambda: llm.generate_content(
+                prompt_string,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
+        )
+        time_to_first_token = time.monotonic() - ttft_start
+        
+        full_response_text = ""
+        # --- DEFINITIVE LOGIC: Nested Try/Except block ---
+        try:
+            # This is the line that can raise an exception.
+            full_response_text = response.text
+        except ValueError:
+            # This block is entered ONLY if accessing .text fails.
+            # We now check if it failed for the expected reason (MAX_TOKENS).
+            if response.candidates and response.candidates[0].finish_reason.name == "MAX_TOKENS":
+                # This is a "successful" run for our performance test.
+                full_response_text = "[Truncated by MAX_TOKENS]"
+            else:
+                # If it failed for another reason (e.g., SAFETY), re-raise the exception
+                # to be caught by the outer `except` block.
+                raise
+        
+        # If we get here, it's a success. Now, get usage data.
+        usage = response.usage_metadata
+        prompt_tokens = usage.prompt_token_count
+        completion_tokens = usage.candidates_token_count
+        total_tokens = usage.total_token_count
+
+    except Exception as e:
+        return {"error": f"Error during generation with {request.model_name}: {e}"}
+
+    total_time = time.monotonic() - start_time
+
+    return {
+        "model_name": request.model_name,
+        "retrieval_time": retrieval_time,
+        "time_to_first_token": time_to_first_token,
+        "total_time": total_time,
+        "requested_tokens": request.max_output_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "response_length_chars": len(full_response_text)
+    }
+
+# --- NEW: Performance Testing Endpoint ---
+@app.post("/test-performance")
+async def run_performance_test(
+    request: TestRequest,
+    api_key: str = Depends(get_api_key),
+    req: Request = None # This is how we get access to the app state
+):
+    """
+    Endpoint to run a single, isolated performance test on the RAG pipeline.
+    """
+    logger.info(f"Running performance test for model: {request.model_name}")
+    retriever = req.app.state.retriever
+    if not retriever:
+        raise HTTPException(status_code=500, detail="Retriever not initialized.")
+    
+    results = await execute_rag_test(request, retriever)
+    return results
+
 
 # --- HTML Frontend ---
 html = """
