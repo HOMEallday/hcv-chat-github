@@ -960,15 +960,22 @@ class ConnectionManager:
         self.sentence_delimiters = re.compile(r'(?<=[.!?])\s+')
 
     async def _get_dialogflow_response(self, transcript_text: str):
+        dialogflow_start_time = time.monotonic()
+        logger.info("[TIMER] DialogFlow Intent Detection STARTED")
+        
         session_path = self.dialogflow_session_path
         text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
         query_input = dialogflow.QueryInput(text=text_input)
         try:
             response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
-            return response.query_result
+            dialogflow_duration = time.monotonic() - dialogflow_start_time
+            logger.info(f"[TIMER] DialogFlow Intent Detection COMPLETED in {dialogflow_duration:.2f} seconds")
+            return response.query_result, dialogflow_duration
         except GoogleAPIError as e:
+            dialogflow_duration = time.monotonic() - dialogflow_start_time
             logger.error(f"Dialogflow API error: {e}")
-            return f"Dialogflow Error: {e}"
+            logger.info(f"[TIMER] DialogFlow Intent Detection ERROR in {dialogflow_duration:.2f} seconds")
+            return f"Dialogflow Error: {e}", dialogflow_duration
     async def tts_task_manager(self, tts_queue: asyncio.Queue):
         while True:
             # Wait for a sentence to be put into the queue.
@@ -1009,15 +1016,42 @@ class ConnectionManager:
     # The final, correct version of your streaming function
     # In your ConnectionManager class, REPLACE the old function with this one
 
-    async def _get_rag_response_and_stream_audio(self, transcript_text: str):
+    async def _get_rag_response_and_stream_audio(self, transcript_text: str, pipeline_start_time: float = None, stt_duration: float = 0):
+        if pipeline_start_time is None:
+            pipeline_start_time = time.monotonic()
+        
         overall_start_time = time.monotonic()
-        logger.info(f"[TIMER] TRUE STREAM RAG STARTED for: '{transcript_text}'")
+        logger.info(f"[TIMER] RAG Pipeline STARTED for: '{transcript_text}'")
 
         if not self.retriever or not self.llm:
             await self.speak("My document search system isn't configured.", AppState.QNA)
             return
 
-        # --- 1. Document Retrieval ---
+        # --- 1. DialogFlow Intent Detection (Optional) ---
+        dialogflow_duration = 0
+        dialogflow_result = None
+        if hasattr(self, 'dialogflow_session_path') and self.dialogflow_session_path:
+            try:
+                dialogflow_result, dialogflow_duration = await self._get_dialogflow_response(transcript_text)
+                # Check if DialogFlow has a specific intent response
+                if (not isinstance(dialogflow_result, str) and 
+                    hasattr(dialogflow_result, 'intent') and 
+                    dialogflow_result.intent.display_name != "Default Fallback Intent"):
+                    
+                    total_pipeline_time = time.monotonic() - pipeline_start_time
+                    logger.info(f"[TIMER] === PIPELINE SUMMARY ===")
+                    logger.info(f"[TIMER] STT Duration: {stt_duration:.2f}s")
+                    logger.info(f"[TIMER] DialogFlow Duration: {dialogflow_duration:.2f}s")
+                    logger.info(f"[TIMER] RAG Duration: 0.00s (skipped - DialogFlow handled)")
+                    logger.info(f"[TIMER] Total Pipeline Time: {total_pipeline_time:.2f}s")
+                    
+                    # Use DialogFlow response directly
+                    await self.speak(dialogflow_result.fulfillment_text, AppState.QNA)
+                    return
+            except Exception as e:
+                logger.error(f"DialogFlow error, falling back to RAG: {e}")
+
+        # --- 2. Document Retrieval ---
         retrieval_start_time = time.monotonic()
         retrieved_docs = await self.retriever.ainvoke(transcript_text)
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
@@ -1115,8 +1149,16 @@ QUESTION:
             
             await self.websocket.send_json({"type": "rag_end"})
             logger.info(f"Full RAG Response: {full_response_text}")
-            overall_duration = time.monotonic() - overall_start_time
-            logger.info(f"[TIMER] TRUE STREAM RAG FINISHED in {overall_duration:.2f} seconds.")
+            rag_duration = time.monotonic() - overall_start_time
+            total_pipeline_time = time.monotonic() - pipeline_start_time
+            
+            # Comprehensive timing summary
+            logger.info(f"[TIMER] === PIPELINE SUMMARY ===")
+            logger.info(f"[TIMER] STT Duration: {stt_duration:.2f}s")
+            logger.info(f"[TIMER] DialogFlow Duration: {dialogflow_duration:.2f}s")
+            logger.info(f"[TIMER] RAG Duration: {rag_duration:.2f}s (includes retrieval + LLM generation)")
+            logger.info(f"[TIMER] Total Pipeline Time (STT → RAG): {total_pipeline_time:.2f}s")
+            logger.info(f"[TIMER] === END SUMMARY ===")
             
             await self.speak("Do you have any other questions?", AppState.QNA)
 
@@ -1276,10 +1318,12 @@ QUESTION:
         finally:
             self.tts_completion_event = None
 
-    async def handle_user_transcript(self, transcript: str):
+    async def handle_user_transcript(self, transcript: str, pipeline_start_time: float = None, stt_duration: float = 0):
         await self.websocket.send_json({"type": "user_transcript", "text": transcript})
         # Launch the logic handler as a non-blocking background task.
-        asyncio.create_task(self.handle_transcript_logic(transcript))
+        if pipeline_start_time is None:
+            pipeline_start_time = time.monotonic()
+        asyncio.create_task(self.handle_transcript_logic(transcript, pipeline_start_time, stt_duration))
 
     async def handle_quiz_answer_logic(self, data: dict):
         """Handles the logic for a submitted quiz answer."""
@@ -1296,7 +1340,7 @@ QUESTION:
         await self._wait_for_tts_completion()
         await self.advance_quiz()
 
-    async def handle_transcript_logic(self, transcript: str):
+    async def handle_transcript_logic(self, transcript: str, pipeline_start_time: float, stt_duration: float):
         """Contains the actual logic for processing a user's speech."""
         current_state = self.current_state
         logger.info(f"Handling transcript logic in state '{current_state.value}': '{transcript}'")
@@ -1323,7 +1367,7 @@ QUESTION:
 
         elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
             # This function is already fully async and handles its own streaming, so it's safe to call directly.
-            await self._get_rag_response_and_stream_audio(transcript)
+            await self._get_rag_response_and_stream_audio(transcript, pipeline_start_time, stt_duration)
 
     async def _start_lesson_logic(self):
         """
@@ -1345,10 +1389,19 @@ QUESTION:
             await self.speak("Hello! I'm your HCV trainer. Before we begin, what's your name?", AppState.INTRODUCTION)  
 
     async def process_speech_result(self, stt_results_queue: asyncio.Queue):
+        pipeline_start_time = None
+        stt_duration = 0
         try:
-            transcript = await stt_results_queue.get()
+            result = await stt_results_queue.get()
+            if isinstance(result, tuple):
+                transcript, pipeline_start_time, stt_duration = result
+            else:
+                # Fallback for backward compatibility
+                transcript = result
+                pipeline_start_time = time.monotonic()
+                
             if transcript:
-                await self.handle_user_transcript(transcript)
+                await self.handle_user_transcript(transcript, pipeline_start_time, stt_duration)
             else:
                 logger.warning("STT returned an empty transcript.")
                 await self.send_ai_response("I'm sorry, I didn't quite catch that. Could you say it again?")
@@ -1455,6 +1508,9 @@ def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_nam
 
 
 async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
+    stt_start_time = time.monotonic()
+    logger.info("[TIMER] STT (Speech-to-Text) STARTED")
+    
     sync_bridge_queue = queue.Queue()
     def sync_stt_call():
         def audio_generator():
@@ -1470,13 +1526,19 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
             for response in responses:
                 if response.results and response.results[0].is_final:
                     transcript = response.results[0].alternatives[0].transcript
+                    stt_duration = time.monotonic() - stt_start_time
+                    logger.info(f"[TIMER] STT COMPLETED in {stt_duration:.2f} seconds")
                     logger.info(f"STT Final Transcript: {transcript}")
-                    stt_results_queue.put_nowait(transcript); return
+                    stt_results_queue.put_nowait((transcript, stt_start_time, stt_duration)); return
             logger.warning("STT stream ended without a final transcript.")
-            stt_results_queue.put_nowait("")
+            stt_duration = time.monotonic() - stt_start_time
+            logger.info(f"[TIMER] STT FAILED in {stt_duration:.2f} seconds")
+            stt_results_queue.put_nowait(("", stt_start_time, stt_duration))
         except Exception as e:
             logger.error(f"Error in sync STT call: {e}")
-            stt_results_queue.put_nowait("")
+            stt_duration = time.monotonic() - stt_start_time
+            logger.info(f"[TIMER] STT ERROR in {stt_duration:.2f} seconds")
+            stt_results_queue.put_nowait(("", stt_start_time, stt_duration))
 
     stt_thread = asyncio.to_thread(sync_stt_call)
     while True:
@@ -1486,6 +1548,9 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
     await stt_thread
 
 async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, rate: str):
+    tts_start_time = time.monotonic()
+    logger.info(f"[TIMER] TTS (Text-to-Speech) STARTED for text: '{text[:50]}...'")
+    
     if not speech_config or not text:
         logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
         return
@@ -1521,10 +1586,16 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, r
     synthesizer.synthesizing.connect(lambda evt: asyncio.run_coroutine_threadsafe(safe_send(evt.result.audio_data, websocket.send_bytes), loop))
     synthesizer.viseme_received.connect(lambda evt: asyncio.run_coroutine_threadsafe(safe_send({"type": "viseme", "offset_ms": evt.audio_offset / 10000, "viseme_id": evt.viseme_id}, websocket.send_json), loop))
     def synthesis_ended(evt):
-        if evt.result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted: asyncio.run_coroutine_threadsafe(safe_send({"type": "tts_stream_finished"}, websocket.send_json), loop)
+        tts_duration = time.monotonic() - tts_start_time
+        if evt.result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted: 
+            logger.info(f"[TIMER] TTS COMPLETED in {tts_duration:.2f} seconds")
+            asyncio.run_coroutine_threadsafe(safe_send({"type": "tts_stream_finished"}, websocket.send_json), loop)
         elif evt.result.reason != speechsdk.ResultReason.Canceled:
             cancellation = speechsdk.SpeechSynthesisCancellationDetails.from_result(evt.result)
             logger.error(f"Azure TTS Error: Reason={cancellation.reason}, Details={cancellation.error_details}")
+            logger.info(f"[TIMER] TTS ERROR in {tts_duration:.2f} seconds")
+        else:
+            logger.info(f"[TIMER] TTS CANCELED in {tts_duration:.2f} seconds")
         if not synthesis_complete_future.done(): synthesis_complete_future.set_result(True)
     
     synthesizer.synthesis_completed.connect(synthesis_ended)

@@ -418,7 +418,7 @@ class ConnectionManager:
         await self.websocket.send_json({"type": "ai_response", "text": text})
         await stream_azure_tts_and_send_to_client(text, self.websocket, self.speech_rate)
 
-    async def handle_user_transcript(self, transcript: str):
+    async def handle_user_transcript(self, transcript: str, pipeline_start_time: float = None, stt_duration: float = 0):
         await self.websocket.send_json({"type": "user_transcript", "text": transcript})
         if self.current_state == AppState.INTRODUCTION:
             user_name = extract_name(transcript)
@@ -451,8 +451,17 @@ class ConnectionManager:
                     self.dialogflow_session_path = dialogflow_sessions_client.session_path(settings.GOOGLE_CLOUD_PROJECT_ID, session_id)
                     asyncio.create_task(transcribe_speech(self.audio_input_queue, stt_results_queue))
                     async def result_handler():
-                        transcript = await stt_results_queue.get()
-                        if transcript: await self.handle_user_transcript(transcript)
+                        result = await stt_results_queue.get()
+                        if isinstance(result, tuple):
+                            transcript, pipeline_start_time, stt_duration = result
+                        else:
+                            # Fallback for backward compatibility
+                            transcript = result
+                            pipeline_start_time = time.monotonic()
+                            stt_duration = 0
+                        
+                        if transcript: 
+                            await self.handle_user_transcript(transcript, pipeline_start_time, stt_duration)
                     asyncio.create_task(result_handler())
             elif command == "end_speech":
                 if self.audio_input_queue: await self.audio_input_queue.put(None); self.audio_input_queue = None

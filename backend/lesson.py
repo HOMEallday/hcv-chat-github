@@ -773,9 +773,17 @@ async def websocket_endpoint(websocket: WebSocket):
                             asyncio.create_task(transcribe_speech(audio_input_queue, stt_results_queue))
 
                             async def result_handler():
-                                transcript = await stt_results_queue.get()
+                                result = await stt_results_queue.get()
+                                if isinstance(result, tuple):
+                                    transcript, pipeline_start_time, stt_duration = result
+                                else:
+                                    # Fallback for backward compatibility
+                                    transcript = result
+                                    pipeline_start_time = time.monotonic()
+                                    stt_duration = 0
+                                
                                 if transcript:
-                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, speech_rate)
+                                    await handle_response_by_state(transcript, websocket, dialogflow_session_path, transition_to_state, current_state, advance_lesson, lesson_step, speech_rate, pipeline_start_time, stt_duration)
                                 else:
                                     reprompt_text = "I didn't catch that. Could you please say it again?"
                                     await websocket.send_json({"type": "ai_response", "text": reprompt_text})
@@ -832,16 +840,23 @@ def log_and_calculate_cost(prompt_tokens: int, completion_tokens: int, model_nam
     logger.info(f"--- RAG Cost --- Tokens: {prompt_tokens}p + {completion_tokens}c = {prompt_tokens + completion_tokens}t | Est. Cost: ${cost:.6f}")
 
 async def get_dialogflow_response(transcript_text: str, session_path: str):
+    dialogflow_start_time = time.monotonic()
+    logger.info("[TIMER] DialogFlow Intent Detection STARTED")
+    
     text_input = dialogflow.TextInput(text=transcript_text, language_code="en-US")
     query_input = dialogflow.QueryInput(text=text_input)
     try:
         response = await dialogflow_sessions_client.detect_intent(session=session_path, query_input=query_input)
-        return response.query_result
+        dialogflow_duration = time.monotonic() - dialogflow_start_time
+        logger.info(f"[TIMER] DialogFlow Intent Detection COMPLETED in {dialogflow_duration:.2f} seconds")
+        return response.query_result, dialogflow_duration
     except GoogleAPIError as e:
+        dialogflow_duration = time.monotonic() - dialogflow_start_time
         logger.error(f"Dialogflow API error: {e}")
-        return f"Dialogflow Error: {e}"
+        logger.info(f"[TIMER] DialogFlow Intent Detection ERROR in {dialogflow_duration:.2f} seconds")
+        return f"Dialogflow Error: {e}", dialogflow_duration
 
-async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, speech_rate: str):
+async def handle_response_by_state(transcript: str, websocket: WebSocket, session_path: str, transition_func, current_state: AppState, advance_lesson_func, lesson_step: int, speech_rate: str, pipeline_start_time: float = None, stt_duration: float = 0):
     await websocket.send_json({"type": "user_transcript", "text": transcript})
 
     if current_state == AppState.INTRODUCTION:
@@ -860,8 +875,11 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
 
     # --- THIS IS THE NEW, ROBUST LOGIC BLOCK ---
     elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
-        dialogflow_result = await get_dialogflow_response(transcript, session_path)
-        intent_name = dialogflow_result.intent.display_name if dialogflow_result else ""
+        if pipeline_start_time is None:
+            pipeline_start_time = time.monotonic()
+        
+        dialogflow_result, dialogflow_duration = await get_dialogflow_response(transcript, session_path)
+        intent_name = dialogflow_result.intent.display_name if not isinstance(dialogflow_result, str) and dialogflow_result else ""
 
         # --- CLEAN 3-WAY LOGIC BRANCH ---
 
@@ -901,21 +919,44 @@ async def handle_response_by_state(transcript: str, websocket: WebSocket, sessio
             await transition_func(AppState.QNA)
 
 async def get_rag_response(transcript_text: str, dialogflow_session_path: str) -> str:
-    logger.info(f"Handling Q&A for: '{transcript_text}'")
+    pipeline_start_time = time.monotonic()
+    logger.info(f"[TIMER] RAG Pipeline STARTED for: '{transcript_text}'")
+    
     if not transcript_text.strip(): return "I didn't catch that. Please repeat."
 
-    dialogflow_response = await get_dialogflow_response(transcript_text, dialogflow_session_path)
-    if not isinstance(dialogflow_response, str) and dialogflow_response.intent.display_name != "Default Fallback Intent":
-        return dialogflow_response.fulfillment_text
+    dialogflow_result, dialogflow_duration = await get_dialogflow_response(transcript_text, dialogflow_session_path)
+    if not isinstance(dialogflow_result, str) and dialogflow_result.intent.display_name != "Default Fallback Intent":
+        total_pipeline_time = time.monotonic() - pipeline_start_time
+        logger.info(f"[TIMER] === PIPELINE SUMMARY ===")
+        logger.info(f"[TIMER] DialogFlow Duration: {dialogflow_duration:.2f}s")
+        logger.info(f"[TIMER] RAG Duration: 0.00s (skipped - DialogFlow handled)")
+        logger.info(f"[TIMER] Total Pipeline Time: {total_pipeline_time:.2f}s")
+        logger.info(f"[TIMER] === END SUMMARY ===")
+        return dialogflow_result.fulfillment_text
 
     if not retrieval_chain: return "My document search system isn't configured."
+    
     logger.info("Falling back to RAG system.")
+    rag_start_time = time.monotonic()
     usage_callback = UsageCallback()
     rag_result = await retrieval_chain.ainvoke({"input": transcript_text}, config={"callbacks": [usage_callback]})
+    rag_duration = time.monotonic() - rag_start_time
+    total_pipeline_time = time.monotonic() - pipeline_start_time
+    
     log_and_calculate_cost(usage_callback.prompt_tokens, usage_callback.completion_tokens)
+    
+    logger.info(f"[TIMER] === PIPELINE SUMMARY ===")
+    logger.info(f"[TIMER] DialogFlow Duration: {dialogflow_duration:.2f}s")
+    logger.info(f"[TIMER] RAG Duration: {rag_duration:.2f}s")
+    logger.info(f"[TIMER] Total Pipeline Time: {total_pipeline_time:.2f}s")
+    logger.info(f"[TIMER] === END SUMMARY ===")
+    
     return rag_result.get("answer", "I couldn't find an answer for that in my documents.")
 
 async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue: asyncio.Queue):
+    stt_start_time = time.monotonic()
+    logger.info("[TIMER] STT (Speech-to-Text) STARTED")
+    
     sync_bridge_queue = queue.Queue()
     def sync_stt_call():
         def audio_generator():
@@ -931,13 +972,19 @@ async def transcribe_speech(audio_input_queue: asyncio.Queue, stt_results_queue:
             for response in responses:
                 if response.results and response.results[0].is_final:
                     transcript = response.results[0].alternatives[0].transcript
+                    stt_duration = time.monotonic() - stt_start_time
+                    logger.info(f"[TIMER] STT COMPLETED in {stt_duration:.2f} seconds")
                     logger.info(f"STT Final Transcript: {transcript}")
-                    stt_results_queue.put_nowait(transcript); return
+                    stt_results_queue.put_nowait((transcript, stt_start_time, stt_duration)); return
             logger.warning("STT stream ended without a final transcript.")
-            stt_results_queue.put_nowait("")
+            stt_duration = time.monotonic() - stt_start_time
+            logger.info(f"[TIMER] STT FAILED in {stt_duration:.2f} seconds")
+            stt_results_queue.put_nowait(("", stt_start_time, stt_duration))
         except Exception as e:
             logger.error(f"Error in sync STT call: {e}")
-            stt_results_queue.put_nowait("")
+            stt_duration = time.monotonic() - stt_start_time
+            logger.info(f"[TIMER] STT ERROR in {stt_duration:.2f} seconds")
+            stt_results_queue.put_nowait(("", stt_start_time, stt_duration))
 
     stt_thread = asyncio.to_thread(sync_stt_call)
     while True:
@@ -950,6 +997,9 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, r
     """
     Generates TTS audio using a DYNAMIC speech rate provided as an argument.
     """
+    tts_start_time = time.monotonic()
+    logger.info(f"[TIMER] TTS (Text-to-Speech) STARTED for text: '{text[:50]}...'")
+    
     if not speech_config or not text:
         logger.warning("Azure Speech not configured or text is empty, skipping TTS.")
         return
@@ -998,12 +1048,17 @@ async def stream_azure_tts_and_send_to_client(text: str, websocket: WebSocket, r
         asyncio.run_coroutine_threadsafe(safe_send_json(viseme_data), loop)
     
     def synthesis_complete_handler(evt: speechsdk.SpeechSynthesisEventArgs):
+        tts_duration = time.monotonic() - tts_start_time
         reason = evt.result.reason
         if reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            logger.info(f"[TIMER] TTS COMPLETED in {tts_duration:.2f} seconds")
             asyncio.run_coroutine_threadsafe(safe_send_json({"type": "tts_stream_finished"}), loop)
         elif reason != speechsdk.ResultReason.Canceled:
             cancellation = speechsdk.SpeechSynthesisCancellationDetails.from_result(evt.result)
             logger.error(f"Azure TTS Error: Reason={cancellation.reason}, Details={cancellation.error_details}")
+            logger.info(f"[TIMER] TTS ERROR in {tts_duration:.2f} seconds")
+        else:
+            logger.info(f"[TIMER] TTS CANCELED in {tts_duration:.2f} seconds")
         
         if not synthesis_complete_future.done():
             synthesis_complete_future.set_result(True)
