@@ -36,3 +36,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Additional project-specific ignores
+# Add any custom files or directories to ignore below
