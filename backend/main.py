@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from enum import Enum, auto
 from typing import Dict, List, Optional, Any
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, APIRouter, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,13 +32,14 @@ from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from sentence_transformers import SentenceTransformer
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import Pinecone
 from pydantic import BaseModel
 import vertexai
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import settings
 import langchain
 
@@ -65,7 +66,20 @@ def initialize_embeddings():
         raise ValueError("Unsupported embedding model")
 
 def initialize_llm(model_name: str = "gemini-2.5-flash"):
-    return GenerativeModel(model_name=model_name)
+    if model_name is None:
+        model_name = settings.GENERATION_MODEL_NAME  # Default to config if not provided
+
+    if settings.GENERATION_MODEL == "gemini":
+        return GenerativeModel(model_name)
+    elif settings.GENERATION_MODEL == "openai":
+        return ChatOpenAI(model=model_name, temperature=0)  # Example: model="gpt-4"
+    elif settings.GENERATION_MODEL == "mistral":
+        # Load Mistral model via Hugging Face
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        return HuggingFacePipeline(model=model, tokenizer=tokenizer)
+    else:
+        raise ValueError(f"Unsupported generation model: {settings.GENERATION_MODEL}")
 
 def initialize_vector_store(chroma_db_path: str, embeddings):
     if os.path.exists(chroma_db_path):
@@ -89,6 +103,8 @@ class TestRequest(BaseModel):
     model_name: str
     prompt: str
     max_output_tokens: int
+
+router = APIRouter()
 
 # --- Application State Enum ---
 class AppState(Enum):
@@ -549,6 +565,7 @@ async def run_performance_test(
     
     results = await execute_rag_test(request, retriever)
     return results
+
 
 
 # --- HTML Frontend ---

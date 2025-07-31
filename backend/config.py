@@ -30,8 +30,9 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "vertexai"  # Options: "vertexai", "openai", "sentence-transformers"
     EMBEDDING_MODEL_NAME: str = "text-embedding-005"  # Specific model name (e.g., "text-embedding-005", "all-MiniLM-L6-v2")
 
-    GENERATION_MODEL: str = "gemini-2.5-flash"  # Options: "gemini-2.5-flash", "gpt-4", "mistral"
-    GENERATION_MODEL_NAME: str = "gemini-2.5-flash"  # Specific model name (if needed)
+    # Generative Model Configuration
+    GENERATION_MODEL: str = "gemini"  # Options: "gemini", "openai", "mistral"
+    GENERATION_MODEL_NAME: str = "gemini-2.5-flash"  # Options: "gemini-2.5-flash", "gpt-4", "mistralai/Mistral-7B-v0.1"
 
     VECTOR_STORE: str = "chroma"  # Options: "chroma", "pinecone", "faiss"
     CHROMA_DB_PATH: str = "data/chroma_db"  # Path to Chroma DB (if using Chroma)
