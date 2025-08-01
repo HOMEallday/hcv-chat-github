@@ -65,15 +65,17 @@ def initialize_embeddings():
     else:
         raise ValueError("Unsupported embedding model")
 
-def initialize_llm(model_name: str = "gemini-2.5-flash"):
+def initialize_llm(provider: str, model_name: str):
     if model_name is None:
         model_name = settings.GENERATION_MODEL_NAME  # Default to config if not provided
+    if provider is None:
+        provider = settings.GENERATION_MODEL
 
-    if settings.GENERATION_MODEL == "gemini":
+    if provider == "gemini":
         return GenerativeModel(model_name)
-    elif settings.GENERATION_MODEL == "openai":
+    elif provider == "openai":
         return ChatOpenAI(model=model_name, temperature=0)  # Example: model="gpt-4"
-    elif settings.GENERATION_MODEL == "mistral":
+    elif provider == "mistral":
         # Load Mistral model via Hugging Face
         model = AutoModelForCausalLM.from_pretrained(model_name)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -103,6 +105,7 @@ class TestRequest(BaseModel):
     model_name: str
     prompt: str
     max_output_tokens: int
+    model_provider: str
 
 router = APIRouter()
 
@@ -385,7 +388,7 @@ async def lifespan(app: FastAPI):
         # --- CORRECTED RAG SETUP ---
         # 1. Initialize LLM and Embeddings
         embeddings = initialize_embeddings()
-        llm = initialize_llm()
+        llm = initialize_llm(model_name=settings.GENERATION_MODEL_NAME, provider=settings.GENERATION_MODEL)
 
         # 2. Set default states
         app.state.retriever = None
@@ -468,102 +471,131 @@ async def dialogflow_webhook(request_body: DialogflowWebhookRequest):
     return JSONResponse(content={"fulfillmentText": fulfillment_text})
 
 
-async def execute_rag_test(request: TestRequest, retriever: Any) -> Dict[str, Any]:
+async def execute_rag_test(request: TestRequest, retriever: Any, llm: Any) -> Dict[str, Any]:
     """
-    Executes a single RAG test without streaming. Returns performance metrics.
+    (Provider Agnostic) Executes a single RAG test without streaming.
+    Handles both native Gemini and LangChain models with maximum robustness.
     """
     start_time = time.monotonic()
-
-    try:
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        }
-        llm = GenerativeModel(request.model_name)
-    except Exception as e:
-        return {"error": f"Failed to initialize model {request.model_name}: {e}"}
-
-    retrieval_start = time.monotonic()
-    retrieved_docs = await retriever.ainvoke(request.prompt)
-    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    retrieval_time = time.monotonic() - retrieval_start
-
-    prompt_string = f"""
-    You are an expert AI assistant on housing policy. Use the provided context to answer the question.
-    If the context does not contain the answer, state that you cannot find the information in the documents.
-
-    CONTEXT:
-    ---
-    {context}
-    ---
-
-    QUESTION:
-    {request.prompt}
-    """
-
-    generation_config = {"max_output_tokens": request.max_output_tokens}
     
-    ttft_start = time.monotonic()
+    model_identifier = f"{request.model_provider}/{request.model_name}"
+    result_payload = {
+        "model_name": model_identifier, "retrieval_time": 0.0, "time_to_first_token": 0.0,
+        "total_time": 0.0, "requested_tokens": request.max_output_tokens, "prompt_tokens": 0,
+        "completion_tokens": 0, "total_tokens": 0, "response_length_chars": 0, "response_text": "", "error": None
+    }
+    full_response_text = ""
+
     try:
-        response = await asyncio.to_thread(
-            lambda: llm.generate_content(
-                prompt_string,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-        )
-        time_to_first_token = time.monotonic() - ttft_start
+        retrieval_start = time.monotonic()
+        retrieved_docs = await retriever.ainvoke(request.prompt)
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        result_payload["retrieval_time"] = time.monotonic() - retrieval_start
+        prompt_string = f"""
+        You are an expert AI assistant for housing policy. Use the provided context to answer the question.
+        **Your answer must be one or two sentences at most.**
+
+        If the context does not contain the answer, state that you cannot find the information in the documents.
+
+        CONTEXT:
+        ---
+        {context}
+        ---
+
+        QUESTION:
+        {request.prompt}
+        """
         
-        full_response_text = ""
-        try:
-            full_response_text = response.text
-        except ValueError:
-            if response.candidates and response.candidates[0].finish_reason.name == "MAX_TOKENS":
-                full_response_text = "[Truncated by MAX_TOKENS]"
-            else:
-                raise
+        ttft_start = time.monotonic()
+
+        if isinstance(llm, GenerativeModel):
+            # --- NATIVE GEMINI LOGIC (USING ROBUST STREAMING) ---
+            generation_config = {"max_output_tokens": request.max_output_tokens}
+            safety_settings = { HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE }
+            
+            # This function will be run in a thread
+            def get_streamed_response():
+                text_so_far = ""
+                final_usage_metadata = None
+                
+                responses_stream = llm.generate_content(
+                    prompt_string,
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
+                    stream=True
+                )
+                
+                for chunk in responses_stream:
+                    try:
+                        text_so_far += chunk.text
+                    except ValueError:
+                        pass # Ignore empty chunks
+                    if hasattr(chunk, 'usage_metadata'):
+                        final_usage_metadata = chunk.usage_metadata
+                
+                return text_so_far, final_usage_metadata
+
+            full_response_text, usage_metadata = await asyncio.to_thread(get_streamed_response)
+            result_payload["time_to_first_token"] = time.monotonic() - ttft_start
+            
+            if usage_metadata:
+                result_payload["prompt_tokens"] = usage_metadata.prompt_token_count
+                result_payload["completion_tokens"] = usage_metadata.candidates_token_count
+                result_payload["total_tokens"] = usage_metadata.total_token_count
+            
+            result_payload["response_text"] = full_response_text
+
+        else:
+            # --- LANGCHAIN MODEL LOGIC (for OpenAI, Anthropic, etc.) ---
+            response = await asyncio.to_thread(llm.invoke, prompt_string)
+            result_payload["time_to_first_token"] = time.monotonic() - ttft_start
+
+            full_response_text = response.content
+            if hasattr(response, 'response_metadata') and 'token_usage' in response.response_metadata:
+                usage = response.response_metadata['token_usage']
+                result_payload["prompt_tokens"] = usage.get('prompt_tokens', 0)
+                result_payload["completion_tokens"] = usage.get('completion_tokens', 0)
+                result_payload["total_tokens"] = usage.get('total_tokens', 0)
+            
+            result_payload["response_text"] = full_response_text
         
-        # If we get here, it's a success. Now, get usage data.
-        usage = response.usage_metadata
-        prompt_tokens = usage.prompt_token_count
-        completion_tokens = usage.total_token_count - usage.prompt_token_count
-        total_tokens = usage.total_token_count
+        result_payload["response_length_chars"] = len(full_response_text)
 
     except Exception as e:
-        return {"error": f"Error during generation with {request.model_name}: {e}"}
+        logging.error(f"A critical error occurred during RAG test: {e}", exc_info=True)
+        result_payload["error"] = str(e)
 
-    total_time = time.monotonic() - start_time
-
-    return {
-        "model_name": request.model_name,
-        "retrieval_time": retrieval_time,
-        "time_to_first_token": time_to_first_token,
-        "total_time": total_time,
-        "requested_tokens": request.max_output_tokens,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "response_length_chars": len(full_response_text)
-    }
-
+    result_payload["total_time"] = time.monotonic() - start_time
+    if result_payload["error"]:
+        result_payload["time_to_first_token"] = -1
+        result_payload["total_time"] = -1
+        
+    return result_payload
 # --- NEW: Performance Testing Endpoint ---
 @app.post("/test-performance")
 async def run_performance_test(
     request: TestRequest,
     api_key: str = Depends(get_api_key),
-    req: Request = None # This is how we get access to the app state
+    req: Request = None
 ):
     """
     Endpoint to run a single, isolated performance test on the RAG pipeline.
     """
-    logger.info(f"Running performance test for model: {request.model_name}")
+    logger.info(f"Running test for provider: {request.model_provider}, model: {request.model_name}")
+    
+    try:
+        llm = initialize_llm(provider=request.model_provider, model_name=request.model_name)
+    except (ValueError, FileNotFoundError) as e: # Catch potential errors from initialization
+        raise HTTPException(status_code=400, detail=str(e))
+
     retriever = req.app.state.retriever
     if not retriever:
         raise HTTPException(status_code=500, detail="Retriever not initialized.")
-    
-    results = await execute_rag_test(request, retriever)
+
+    results = await execute_rag_test(request, retriever, llm)
     return results
 
 
@@ -1278,7 +1310,7 @@ QUESTION:
                     "Hmm, that's a good one.", "Let me look that up for you.", "That's an interesting question.", "One second"
                 ]
         thinking_text = random.choice(thinking_phrases)
-        await self.send_ai_response(thinking_text, AppState.QNA)
+        await self.speak(thinking_text, AppState.QNA)
 
         logger.info("[TIMER] 'Thinking & Waiting' task now waiting for client 'tts_finished' signal...")
         try:
@@ -1340,7 +1372,21 @@ QUESTION:
 
         elif current_state in [AppState.LESSON_QNA, AppState.QNA, AppState.QUIZ_COMPLETE]:
             # This function is already fully async and handles its own streaming, so it's safe to call directly.
-            await self._get_rag_response_and_stream_audio(transcript)
+            logger.info("Q&A state detected. Routing to Dialogflow for intent recognition.")
+            dialogflow_result = await self._get_dialogflow_response(transcript)
+            intent_name = dialogflow_result.intent.display_name
+        
+            logger.info(f"Dialogflow recognized intent: '{intent_name}'")
+            if intent_name == 'DenyFollowup':
+                await self.speak("Great, let's continue.", AppState.LESSON_DELIVERY)
+                await self._wait_for_tts_completion()
+                await self.advance_lesson()
+                return
+            elif intent_name == 'ConfirmQuestion':
+                await self.speak("Of course, what's your question?", AppState.QNA)
+                return
+            else:
+                await self._get_rag_response_and_stream_audio(transcript)
 
     async def _start_lesson_logic(self):
         """
@@ -1368,10 +1414,10 @@ QUESTION:
                 await self.handle_user_transcript(transcript)
             else:
                 logger.warning("STT returned an empty transcript.")
-                await self.send_ai_response("I'm sorry, I didn't quite catch that. Could you say it again?")
+                await self.speak("I'm sorry, I didn't quite catch that. Could you say it again?")
         except Exception as e:
             logger.error(f"An unexpected error occurred in process_speech_result: {e}", exc_info=True)
-            await self.send_ai_response("I'm sorry, an error occurred while processing your speech.")
+            await self.speak("I'm sorry, an error occurred while processing your speech.")
 
         finally:
             logger.info("Speech processing task finished. Resetting for next interaction.")
